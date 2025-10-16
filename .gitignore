@@ -3,3 +3,9 @@ venv/
 
 # Secrets file
 .env
+
+# Others
+__pycache__/
+*.pyc
+.DS_Store
+.env.local
