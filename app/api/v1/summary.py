@@ -4,6 +4,7 @@ from app.summarize.llm import summarize_items
 from app.fetch.content import fetch_article_text
 from app.ingest.news import fetch_news_for_ticker
 from app.ingest.filings_utils import get_filings_for
+from app.core.cache import url_to_hash, cache_get_summary, cache_upsert_summary
 
 router = APIRouter()
 
@@ -14,29 +15,80 @@ async def summarize_test(ticker: str):
     filings = await get_filings_for(ticker)
     all_items = news + filings
 
-    # Fetch article content for each item before summarization
-    enriched_items = []
-    for item in all_items:
-        url = item.get("url")
-        if url:
-            article_data = await fetch_article_text(url)
-            item["translated_text"] = article_data.get("translated_text", "")
-            item["lang"] = article_data.get("lang", "")
-            print(f"Fetched article for {ticker}: lang={item.get('lang')}, text_len={len(item.get('translated_text',''))}")
-        enriched_items.append(item)
+    # Build candidates (items allowed for summary)
+    candidates = [i for i in all_items if i.get("summary_allowed", True)]
 
-    # Keep items that have some text (translated_text/content) and are allowed to summarize.
-    candidates = []
-    for it in enriched_items:
-        if not it.get("summary_allowed", True):
+    cached_results = []
+    to_summarize = []
+
+    # Check cache first; only enrich (fetch article text) for misses
+    for it in candidates:
+        url = it.get("url", "") or ""
+        if not url:
             continue
-        txt = (it.get("translated_text") or it.get("content") or "").strip()
-        if len(txt) >= 300:  # simple floor to avoid empty pages
-            candidates.append(it)
-    print(f"[summarize] {ticker}: {len(candidates)} of {len(enriched_items)} items will be sent to LLM")
+        hit = await cache_get_summary(url, max_age_hours=24)
+        if hit:
+            cached_results.append({
+                "title": it.get("title", ""),
+                "url": url,
+                "bullets": hit.get("bullets", []),
+                "why_it_matters": hit.get("why_it_matters", ""),
+                "sentiment": hit.get("sentiment", "Neutral"),
+            })
+        else:
+            # enrich item with article text before sending to LLM
+            article_data = await fetch_article_text(url)
+            it["translated_text"] = article_data.get("translated_text", "")
+            it["lang"] = article_data.get("lang", "")
+            to_summarize.append(it)
 
-    print("→ Using real LLM summarizer")
-    summary = await summarize_items(candidates, ticker=ticker)
-    print("→ summarizer returned")
+    # Build payload that always carries title + url and only includes items with meaningful text
+    to_summarize_payload = []
+    for it in all_items:
+        txt = (it.get("translated_text") or "").strip()
+        if len(txt) < 300:
+            continue
+        to_summarize_payload.append({
+            "title": it.get("title", ""),
+            "url": it.get("url", ""),
+            "text": txt,
+            "source": it.get("source", ""),
+            "category": it.get("category", ""),
+            "published_at": it.get("published_at", ""),
+        })
+    print(f"[summarize] sending={len(to_summarize_payload)} (english-only ≥300 chars)")
 
-    return summary
+    if not to_summarize_payload and not cached_results:
+        print("[summarize] nothing to summarize (no text after extraction/lang filter)")
+
+    summary = {}
+    llm_results = []
+
+    if to_summarize_payload:
+        print("→ Using real LLM summarizer")
+        summary = await summarize_items(to_summarize_payload, ticker=ticker)
+        llm_results = summary.get("items", []) or []
+        # Only upsert summaries for items that were actually sent to the LLM
+        sent_urls = {i.get("url", "") for i in to_summarize_payload}
+        for r in llm_results:
+            url = r.get("url", "") or ""
+            if url not in sent_urls:
+                print(f"[cache] skipping upsert for {url}: not sent to LLM")
+                continue
+            await cache_upsert_summary(
+                ticker=ticker,
+                url_hash=url_to_hash(url),
+                bullets=r.get("bullets", []),
+                why_it_matters=r.get("why_it_matters", ""),
+                sentiment=r.get("sentiment", "Neutral"),
+            )
+        print("→ summarizer returned")
+
+    items = cached_results + llm_results
+
+    return {
+        "ticker": ticker,
+        "items": items,
+        "token_usage": summary.get("token_usage", {}),
+        "latency_ms": summary.get("latency_ms", 0),
+    }

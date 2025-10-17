@@ -7,7 +7,7 @@ from fastapi import FastAPI, Query, HTTPException
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, httpx
+import os, httpx, aiosqlite
 
 USE_MOCK = os.getenv("USE_MOCK_FILINGS", "false").lower() in {"1", "true", "yes"}
 USE_BROWSER = os.getenv("USE_BROWSER_FETCH", "false").lower() in {"1", "true", "yes"}
@@ -25,8 +25,13 @@ from app.ingest.filings import filter_for_summary, dedupe_by_url_or_title, gener
 from app.ingest.news import fetch_news_for_ticker
 from app.summarize.llm import summarize_items
 from app.ingest.filings_utils import get_filings_for
+from app.core.cache import init_db, cache_get_by_ticker, cache_upsert_items, url_to_hash, CACHE_DB_PATH  # if you exported CACHE_DB_PATH; else use literal path
 
 app = FastAPI(title="A.R.I. Engine")
+
+@ app.on_event("startup")
+async def _startup():
+    await init_db()
 
 # Register API v1 summary router
 from app.api.v1 import summary
@@ -88,8 +93,19 @@ async def get_news_brief(
 
     for ticker in tickers_list:
         try:
-            news = fetch_news_for_ticker(ticker) or []
-            filings = await get_filings_for(ticker)
+            # Try cache first
+            cached = await cache_get_by_ticker(ticker, max_age_hours=24)
+            news = cached.get("news", []) or []
+            filings = cached.get("filings", []) or []
+
+            # Fall back to live and populate cache when missing
+            if not news:
+                news = fetch_news_for_ticker(ticker) or []
+                await cache_upsert_items(news, kind="news", ticker=ticker)
+            if not filings:
+                filings = await get_filings_for(ticker)
+                await cache_upsert_items(filings, kind="filings", ticker=ticker)
+
             news = _cap_latest(news, 5)
             filings = _cap_latest(filings, 5)
             result[ticker] = {"news": news, "filings": filings}
@@ -138,6 +154,17 @@ async def debug_openai():
         "key_repr": repr(key),
         "body": body,
     }
+
+@app.post("/debug/cache/delete_by_url")
+async def debug_cache_delete_by_url(url: str):
+    h = url_to_hash(url)
+    db = "/Users/chitharanjan/ARI/ari_cache.db"
+    async with aiosqlite.connect(db) as conn:
+        await conn.execute("DELETE FROM summaries WHERE item_url_hash=?", (h,))
+        await conn.execute("DELETE FROM articles WHERE url_hash=?", (h,))
+        await conn.execute("DELETE FROM filings WHERE url_hash=?", (h,))
+        await conn.commit()
+    return {"deleted_hash": h}
 
 try:
     from app.ingest.filings import generate_mock_filings
