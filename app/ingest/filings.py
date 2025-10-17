@@ -1,107 +1,237 @@
-import os, httpx
+# app/ingest/filings.py
+from __future__ import annotations
 from typing import List, Dict
+from datetime import datetime
+import httpx
+import asyncio
 from datetime import datetime, timedelta
-import xml.etree.ElementTree as ET
 
-EXCLUDE_CATEGORIES = {"ANNUAL REPORT", "QUARTERLY RESULTS", "EARNINGS CALL TRANSCRIPT", "TRANSCRIPT"}
-from typing import List, Dict
+from app.ingest.tickers import resolve
+from app.ingest.filings_browser import (
+    fetch_bse_announcements_browser,
+    fetch_nse_announcements_browser,
+)
 
-EXCLUDE_CATEGORIES = {"ANNUAL REPORT", "QUARTERLY RESULTS", "EARNINGS CALL TRANSCRIPT", "TRANSCRIPT"}
+BSE_API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
+NSE_API_URL = "https://www.nseindia.com/api/corporate-announcements?symbol={symbol}"
 
-def filter_for_summary(items: List[Dict]) -> List[Dict]:
-    """
-    Backward-compat layer: ensure each item has `summary_allowed`.
-    If fetchers already set it, we keep it; otherwise compute from category/title.
-    """
-    out = []
-    for it in items:
-        if "summary_allowed" not in it:
-            cat_or_title = (it.get("category") or it.get("title") or "").upper()
-            it["summary_allowed"] = not any(key in cat_or_title for key in EXCLUDE_CATEGORIES)
-        out.append(it)
-    return out
+BSE_HEADERS = {
+    "Origin": "https://www.bseindia.com",
+    "Referer": "https://www.bseindia.com/corporates/ann.aspx",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Connection": "keep-alive",
+    "Host": "api.bseindia.com",
+}
 
-def dedupe_by_url_or_title(items: List[Dict]) -> List[Dict]:
-    seen = set()
-    out = []
-    for it in items:
-        key = (it.get("url") or "").strip().lower() or (it.get("title") or "").strip().lower()
-        if key and key not in seen:
-            seen.add(key)
-            out.append(it)
-    return out
+NSE_HEADERS = {
+    "referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "accept": "application/json, text/plain, */*",
+    "connection": "keep-alive",
+    "cache-control": "no-cache",
+    "host": "www.nseindia.com",
+}
+
+EXCLUDE_KEYWORDS = ["ANNUAL REPORT", "QUARTERLY RESULTS", "TRANSCRIPT"]
+
 def _iso(ts: str) -> str:
+    """Safely convert any date string to ISO8601Z format."""
+    if not ts:
+        return ""
     try:
-        return datetime.fromisoformat(ts.replace("Z","")).isoformat() + "Z"
+        # Try parsing common formats
+        dt = None
+        for fmt in ("%d %b %Y %H:%M", "%d-%m-%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(ts, fmt)
+                break
+            except Exception:
+                continue
+        if not dt:
+            dt = datetime.fromisoformat(ts)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
-        return datetime.utcnow().isoformat() + "Z"
+        return ts
 
 def _should_exclude(cat: str) -> bool:
-    cat = (cat or "").upper()
-    return any(x in cat for x in EXCLUDE_CATEGORIES)
+    """Skip announcements containing certain keywords."""
+    if not cat:
+        return False
+    cat_upper = cat.upper()
+    return any(kw in cat_upper for kw in EXCLUDE_KEYWORDS)
+
+def filter_for_summary(items: List[Dict]) -> List[Dict]:
+    """Adds summary_allowed flag based on category exclusion."""
+    for item in items:
+        item["summary_allowed"] = not _should_exclude(item.get("category", ""))
+    return items
+
+def dedupe_by_url_or_title(items: List[Dict]) -> List[Dict]:
+    """Removes duplicate announcements by url or title."""
+    seen = set()
+    result = []
+    for item in items:
+        key = (item.get("url") or "") + "|" + (item.get("title") or "")
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
 
 async def fetch_bse_announcements(ticker: str) -> List[Dict]:
-    """Fetch latest filings for a given symbol from BSE RSS feed."""
-    url = "https://www.bseindia.com/xml-data/corpfiling/CorpFiling.xml"
-    items: List[Dict] = []
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return items
-            root = ET.fromstring(r.text)
-            for entry in root.findall(".//Item"):
-                company = entry.findtext("Company")
-                headline = entry.findtext("Headline")
-                attachment = entry.findtext("Attachment")
-                date = entry.findtext("Date")
-                if company and ticker.upper() not in company.upper():
+    info = resolve(ticker)
+    bse_code = info.get("bse_code", "")
+    if not bse_code:
+        print("BSE: missing bse_code for", ticker)
+        return []
+    payload = {
+        "strCat": "Company",
+        "strPrevDate": (datetime.utcnow() - timedelta(days=7)).strftime("%d-%m-%Y"),
+        "strScrip": bse_code,
+    }
+    tries = 3
+    rows = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for i in range(tries):
+            # Warm-up GET before each POST
+            await client.get("https://www.bseindia.com/corporates/ann.aspx", headers=BSE_HEADERS)
+            try:
+                resp = await client.post(BSE_API_URL, json=payload, headers=BSE_HEADERS)
+                if resp.status_code in (301, 302, 403) or "error_Bse.html" in resp.text:
+                    print(f"BSE blocked (try {i+1}/3) → retrying after 1s")
+                    await asyncio.sleep(1)
                     continue
-                items.append({
-                    "title": headline or company or "",
-                    "url": attachment or "",
-                    "published_at": _iso(date or ""),
-                    "source": "BSE",
-                    "category": "ANNOUNCEMENT",
-                    "summary_allowed": not _should_exclude(headline or ""),
-                })
-    except Exception as e:
-        print("BSE error:", e)
-    return items[:10]  # limit
+                resp.raise_for_status()
+                data = resp.json()
+                rows = data.get("Table", []) if isinstance(data, dict) else []
+                break
+            except Exception as e:
+                if i == tries - 1:
+                    print(f"BSE fetch error for {ticker}: {e}")
+                    return []
+                await asyncio.sleep(1)
+        else:
+            print("BSE blocked completely for", ticker)
+            return []
+    items = []
+    for row in rows:
+        title = row.get("SUBJECT") or row.get("HEADLINE") or ""
+        url = row.get("ATTACHMENTURL") or row.get("DETAILSURL") or ""
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url and url.startswith("/"):
+            url = "https://www.bseindia.com" + url
+        elif url and not url.startswith("http"):
+            url = "https://www.bseindia.com/" + url
+        published_at = _iso(row.get("NEWS_DT") or row.get("DT_TM") or "")
+        category = row.get("HEADLINE") or "ANNOUNCEMENT"
+        items.append({
+            "title": title.strip(),
+            "url": url.strip(),
+            "published_at": published_at,
+            "source": "BSE",
+            "category": category.strip(),
+        })
+    items = dedupe_by_url_or_title(filter_for_summary(items))
+    items = sorted(items, key=lambda x: x.get("published_at", ""), reverse=True)[:10]
+    print(f"BSE total={len(rows)} kept={len(items)} for {ticker} (code={bse_code})")
+    return items
 
 async def fetch_nse_announcements(ticker: str) -> List[Dict]:
-    """Fetch latest filings for a given symbol from NSE JSON feed."""
-    url = "https://www.nseindia.com/api/corporate-announcements?index=equities"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.nseindia.com/",
-        "Origin": "https://www.nseindia.com",
-    }
-    items: List[Dict] = []
-    try:
-        async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
-            await client.get("https://www.nseindia.com/")  # warm cookies
-            r = await client.get(url)
-            if r.status_code != 200:
-                return items
-            data = r.json() or {}
-            for row in data.get("data", []):
-                sym = (row.get("symbol") or "").upper()
-                if sym != ticker.upper():
-                    continue
-                title = (row.get("sm_desc") or row.get("headline") or "").strip()
-                link  = (row.get("pdfUrl") or row.get("attachement") or "").strip()
-                cat   = (row.get("category") or "").strip().upper()
-                dt    = _iso(row.get("date") or row.get("dissemDate") or "")
-                items.append({
-                    "title": title,
-                    "url": link,
-                    "published_at": dt,
-                    "source": "NSE",
-                    "category": cat or "ANNOUNCEMENT",
-                    "summary_allowed": not _should_exclude(cat),
-                })
-    except Exception as e:
-        print("NSE error:", e)
-    return items[:10]
+    meta = resolve(ticker)
+    wanted = meta.get("nse_symbol", "").upper()
+    aliases = [meta.get("company_name", "")] + meta.get("aliases", [])
+    tries = 3
+    rows = []
+    async with httpx.AsyncClient(timeout=20, headers=NSE_HEADERS, cookies=httpx.Cookies(), follow_redirects=True) as client:
+        await client.get("https://www.nseindia.com/", headers=NSE_HEADERS)
+        await asyncio.sleep(0.5)
+        for i in range(tries):
+            resp = await client.get(NSE_API_URL.format(symbol=wanted), headers=NSE_HEADERS)
+            ctype = resp.headers.get("content-type", "")
+            if resp.status_code != 200 or "text/html" in ctype:
+                print(f"NSE API blocked or HTML for {ticker} (try {i+1}/3), status={resp.status_code}")
+                await asyncio.sleep(1.5)
+                continue
+            try:
+                data = resp.json()
+            except Exception as e:
+                print(f"NSE JSON error for {ticker}: {e}")
+                return []
+            if isinstance(data, dict):
+                rows = data.get("data", [])
+            elif isinstance(data, list):
+                rows = data
+            else:
+                rows = []
+            break
+        else:
+            print("NSE permanently blocked for", ticker)
+            return []
+    items = []
+    for row in rows:
+        symbol = row.get("symbol", "")
+        company_name = row.get("companyName", "")
+        if symbol:
+            if not symbol.upper().startswith(wanted):
+                continue
+        elif company_name:
+            if not any(alias.upper() in company_name.upper() for alias in aliases):
+                continue
+        title = row.get("sm_desc") or row.get("headline") or ""
+        url = row.get("pdfUrl") or row.get("announcementUrl") or ""
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url and url.startswith("/"):
+            url = "https://www.nseindia.com" + url
+        elif url and not url.startswith("http"):
+            url = "https://www.nseindia.com/" + url
+        published_at = _iso(row.get("announcementDate") or row.get("date") or row.get("dissemDate") or "")
+        category = row.get("category") or "ANNOUNCEMENT"
+        items.append({
+            "title": title.strip(),
+            "url": url.strip(),
+            "published_at": published_at,
+            "source": "NSE",
+            "category": category.strip(),
+        })
+    items = dedupe_by_url_or_title(filter_for_summary(items))
+    items = sorted(items, key=lambda x: x.get("published_at", ""), reverse=True)[:10]
+    print(f"NSE total={len(rows)} kept={len(items)} for {ticker} symbol={wanted}")
+    return items
+
+async def fetch_filings_with_browser(ticker: str) -> list:
+    # Try API first
+    nse = await fetch_nse_announcements(ticker)
+    bse = await fetch_bse_announcements(ticker)
+    filings = (nse or []) + (bse or [])
+    if filings:
+        return sorted(filings, key=lambda x: x.get("published_at", ""), reverse=True)[:5]
+    # Fallback to Playwright scraping
+    print(f"Browser fallback triggered for {ticker}")
+    nse_browser = await fetch_nse_announcements_browser(ticker)
+    bse_browser = await fetch_bse_announcements_browser(ticker)
+    filings_browser = (nse_browser or []) + (bse_browser or [])
+    return sorted(filings_browser, key=lambda x: x.get("published_at", ""), reverse=True)[:5]
+
+def generate_mock_filings(ticker: str) -> list[dict]:
+    now = datetime.utcnow()
+    return [
+        {
+            "title": f"{ticker}: Board meeting outcome (mock)",
+            "url": "https://example.com/bse.pdf",
+            "published_at": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "BSE",
+            "category": "BOARD MEETING",
+            "summary_allowed": True,
+        },
+        {
+            "title": f"{ticker}: Press release (mock)",
+            "url": "https://example.com/nse.pdf",
+            "published_at": (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "NSE",
+            "category": "PRESS RELEASE",
+            "summary_allowed": True,
+        },
+    ]
