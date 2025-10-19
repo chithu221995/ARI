@@ -1,94 +1,119 @@
-import asyncio
-from fastapi import APIRouter, Query
-from app.summarize.llm import summarize_items
-from app.fetch.content import fetch_article_text
-from app.ingest.news import fetch_news_for_ticker
-from app.ingest.filings_utils import get_filings_for
-from app.core.cache import url_to_hash, cache_get_summary, cache_upsert_summary
+from __future__ import annotations
+import logging
+import inspect
+from typing import Dict, Any, List
 
+from fastapi import APIRouter, Body
+from app.summarize.llm import summarize_items
+from app.ingest.news import fetch_news_for_ticker, select_top_news_for_summary
+
+log = logging.getLogger("ari.summary.api")
 router = APIRouter()
 
+# optional content fetcher for better LLM input
+try:
+    from app.fetch.content import fetch_article_text
+except Exception:
+    fetch_article_text = None
+
+
 @router.get("/api/v1/summarize")
-async def summarize_test(ticker: str):
-    # gather items (news + filings)
-    news = fetch_news_for_ticker(ticker) or []
-    filings = await get_filings_for(ticker)
-    all_items = news + filings
-
-    # Build candidates (items allowed for summary)
-    candidates = [i for i in all_items if i.get("summary_allowed", True)]
-
-    cached_results = []
-    to_summarize = []
-
-    # Check cache first; only enrich (fetch article text) for misses
-    for it in candidates:
-        url = it.get("url", "") or ""
-        if not url:
-            continue
-        hit = await cache_get_summary(url, max_age_hours=24)
-        if hit:
-            cached_results.append({
-                "title": it.get("title", ""),
-                "url": url,
-                "bullets": hit.get("bullets", []),
-                "why_it_matters": hit.get("why_it_matters", ""),
-                "sentiment": hit.get("sentiment", "Neutral"),
-            })
+async def summarize_get(ticker: str):
+    # gather items (up to 20) for the ticker
+    try:
+        if inspect.iscoroutinefunction(fetch_news_for_ticker):
+            items = await fetch_news_for_ticker(ticker, only_en=True, max_items=20)
         else:
-            # enrich item with article text before sending to LLM
-            article_data = await fetch_article_text(url)
-            it["translated_text"] = article_data.get("translated_text", "")
-            it["lang"] = article_data.get("lang", "")
-            to_summarize.append(it)
+            items = fetch_news_for_ticker(ticker, only_en=True, max_items=20)
+    except Exception:
+        log.exception("summary.api: failed to fetch news for ticker=%s", ticker)
+        items = []
 
-    # Build payload that always carries title + url and only includes items with meaningful text
-    to_summarize_payload = []
-    for it in all_items:
-        txt = (it.get("translated_text") or "").strip()
-        if len(txt) < 300:
-            continue
-        to_summarize_payload.append({
-            "title": it.get("title", ""),
-            "url": it.get("url", ""),
-            "text": txt,
-            "source": it.get("source", ""),
-            "category": it.get("category", ""),
-            "published_at": it.get("published_at", ""),
-        })
-    print(f"[summarize] sending={len(to_summarize_payload)} (english-only ≥300 chars)")
+    # enrich with article text if fetcher available
+    enriched: List[Dict[str, Any]] = []
+    for a in items or []:
+        try:
+            if fetch_article_text:
+                if inspect.iscoroutinefunction(fetch_article_text):
+                    art = await fetch_article_text(a.get("url", "") or "")
+                else:
+                    art = fetch_article_text(a.get("url", "") or "")
+                a["translated_text"] = art.get("translated_text", "") or ""
+                a["lang"] = art.get("lang", "") or a.get("lang", "")
+            else:
+                a["translated_text"] = a.get("content", "") or ""
+            enriched.append(a)
+        except Exception:
+            log.exception("summary.api: article enrichment failed for url=%s", a.get("url"))
+            a["translated_text"] = a.get("content", "") or ""
+            a["lang"] = a.get("lang", "")
+            enriched.append(a)
 
-    if not to_summarize_payload and not cached_results:
-        print("[summarize] nothing to summarize (no text after extraction/lang filter)")
+    # select top N for summarization (english + content + score + recency)
+    batch = select_top_news_for_summary(enriched, max_items=5)
+    print(f"[summary] batch size={len(batch)} (after english+content filter)")
+    log.info("summary.api: calling LLM summarize for ticker=%s n_items=%d", ticker, len(batch or []))
+    out: Dict[str, Any] = await summarize_items(batch or [], ticker=ticker)
 
-    summary = {}
-    llm_results = []
+    if not out.get("ok", True):
+        log.info("summary.api: LLM summarize failed for ticker=%s error=%s", ticker, out.get("error"))
+        return {
+            "ok": False,
+            "items": [],
+            "error": out.get("error", "llm_failed"),
+            "usage": out.get("usage", {}),
+            "latency_ms": out.get("latency_ms"),
+        }
 
-    if to_summarize_payload:
-        print("→ Using real LLM summarizer")
-        summary = await summarize_items(to_summarize_payload, ticker=ticker)
-        llm_results = summary.get("items", []) or []
-        # Only upsert summaries for items that were actually sent to the LLM
-        sent_urls = {i.get("url", "") for i in to_summarize_payload}
-        for r in llm_results:
-            url = r.get("url", "") or ""
-            if url not in sent_urls:
-                print(f"[cache] skipping upsert for {url}: not sent to LLM")
-                continue
-            await cache_upsert_summary(
-                ticker=ticker,
-                url_hash=url_to_hash(url),
-                bullets=r.get("bullets", []),
-                why_it_matters=r.get("why_it_matters", ""),
-                sentiment=r.get("sentiment", "Neutral"),
-            )
-        print("→ summarizer returned")
+    log.info("summary.api: LLM summarize succeeded for ticker=%s items=%d latency_ms=%s", ticker, len(out.get("items", [])), out.get("latency_ms"))
+    return {"ok": True, **out}
 
-    items = cached_results + llm_results
 
-    return {
-        "ticker": ticker,
-        "items": items,
-        "token_usage": summary.get("token_usage", {}),
-        "latency_ms": summary.get("latency_ms", 0),
-    }
+@router.post("/api/v1/summarize")
+async def summarize_post(payload: Dict[str, Any] = Body(...)):
+    ticker = (payload or {}).get("ticker", "")
+    try:
+        if inspect.iscoroutinefunction(fetch_news_for_ticker):
+            items = await fetch_news_for_ticker(ticker, only_en=True, max_items=20)
+        else:
+            items = fetch_news_for_ticker(ticker, only_en=True, max_items=20)
+    except Exception:
+        log.exception("summary.api: failed to fetch news for ticker=%s", ticker)
+        items = []
+
+    enriched: List[Dict[str, Any]] = []
+    for a in items or []:
+        try:
+            if fetch_article_text:
+                if inspect.iscoroutinefunction(fetch_article_text):
+                    art = await fetch_article_text(a.get("url", "") or "")
+                else:
+                    art = fetch_article_text(a.get("url", "") or "")
+                a["translated_text"] = art.get("translated_text", "") or ""
+                a["lang"] = art.get("lang", "") or a.get("lang", "")
+            else:
+                a["translated_text"] = a.get("content", "") or ""
+            enriched.append(a)
+        except Exception:
+            log.exception("summary.api: article enrichment failed for url=%s", a.get("url"))
+            a["translated_text"] = a.get("content", "") or ""
+            a["lang"] = a.get("lang", "")
+            enriched.append(a)
+
+    batch = select_top_news_for_summary(enriched, max_items=5)
+    print(f"[summary] batch size={len(batch)} (after english+content filter)")
+    log.info("summary.api: calling LLM summarize (POST) for ticker=%s n_items=%d", ticker, len(batch or []))
+    out: Dict[str, Any] = await summarize_items(batch or [], ticker=ticker)
+
+    if not out.get("ok", True):
+        log.info("summary.api: LLM summarize failed (POST) for ticker=%s error=%s", ticker, out.get("error"))
+        return {
+            "ok": False,
+            "items": [],
+            "error": out.get("error", "llm_failed"),
+            "usage": out.get("usage", {}),
+            "latency_ms": out.get("latency_ms"),
+        }
+
+    log.info("summary.api: LLM summarize succeeded (POST) for ticker=%s items=%d latency_ms=%s", ticker, len(out.get("items", [])), out.get("latency_ms"))
+    return {"ok": True, **out}

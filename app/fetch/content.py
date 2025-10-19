@@ -1,36 +1,46 @@
+import httpx
 import trafilatura
 from datetime import datetime
+from typing import Dict, Any
+
 from app.utils.lang import detect_language
 
-async def fetch_article_text(url: str) -> dict:
+
+def fetch_article_text(url: str) -> Dict[str, Any]:
+    """
+    Fetch page and extract text using trafilatura.
+    Always return a dict with keys:
+      - lang: detected language (or "unknown")
+      - translated_text: text only if detected as English, else ""
+      - content: raw extracted text or ""
+      - chars: length of extracted text
+      - fetched_at: ISO timestamp (UTC)
+    Do not default non-English to "en".
+    """
+    text = ""
     try:
-        downloaded = trafilatura.fetch_url(url)
-        text = trafilatura.extract(
-            downloaded,
-            include_comments=False,
-            include_tables=False,
-            include_formatting=False,
-            no_fallback=True
-        ) if downloaded else ""
-        text = text or ""
+        resp = httpx.get(url, timeout=10)
+        if resp is not None and resp.status_code == 200:
+            html = resp.text or ""
+            try:
+                extracted = trafilatura.extract(html) or ""
+            except Exception:
+                extracted = ""
+            text = extracted or ""
     except Exception:
         text = ""
 
-    lang = detect_language(text)
-    print(f"[content] {url} -> lang={lang}, chars={len(text)}")
+    try:
+        lang = detect_language(text or "")
+    except Exception:
+        lang = "unknown"
 
-    # Cheap guard: treat very short extracts as empty so callers skip them.
-    # Prototype: block non-English content by returning empty translated_text.
-    if len(text) < 300:
-        translated = ""
-    elif lang != "en":
-        translated = ""  # block non-English in prototype
-    else:
-        translated = text
+    translated = text if lang == "en" else ""
 
     return {
         "lang": lang,
         "translated_text": translated,
-        "chars": len(translated),
-        "fetched_at": datetime.utcnow().isoformat() + "Z"
+        "content": text or "",
+        "chars": len(text or ""),
+        "fetched_at": datetime.utcnow().isoformat() + "Z",
     }

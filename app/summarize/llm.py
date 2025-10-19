@@ -1,134 +1,166 @@
+from __future__ import annotations
 import os
 import time
 import json
-from typing import List, Dict
-from dotenv import load_dotenv
+import logging
+from typing import List, Dict, Any
+
 import httpx
 
-load_dotenv()
+log = logging.getLogger("ari.summarize")
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # adjust as needed
+OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+
+if not OPENAI_API_KEY:
+    log.warning("[summary] OPENAI_API_KEY missing — summarizer will return empty output")
 
 SYSTEM_PROMPT = (
-    "You are a financial assistant. Summarize provided article texts. "
-    "Return STRICT JSON (no markdown, no prose) with this schema: "
-    '{"items":[{"title":str,"url_id":str,"bullets":[str,str,str],"why_it_matters":str,"sentiment":"Positive|Neutral|Negative"}]} '
-    "Do not invent URLs or titles—reuse exactly what is provided. Use url_id tokens exactly as given."
+    "You are an assistant that ingests a small list of news items and produces concise actionable summaries. "
+    "For each input item produce a short paragraph (3-4 sentences) that explains the gist and why it matters for the asset. "
+    "Must include a line starting with exactly 'Sentiment: ' followed by one of Positive, Neutral, or Negative. "
+    "Output a JSON object with a top-level key 'items' that is an array of objects. Each object should include at least: "
+    "'title' (string), 'bullets' (array of short bullet strings -- optional), 'why_it_matters' (string), and 'sentiment' (string). "
+    "You may wrap the JSON in markdown code fences but ensure the JSON is parseable. Keep responses concise and factual."
 )
 
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-MODEL = "gpt-4o-mini"
 
-def _estimate_tokens(text: str) -> int:
-    # Rough estimate: 1 token ≈ 4 chars
-    return max(1, len(text) // 4)
-
-async def summarize_items(items: List[Dict], *, ticker: str) -> Dict:
+async def summarize_items(batch: List[Dict[str, Any]], *, ticker: str | None = None) -> Dict[str, Any]:
     """
-    Expect each item to have: title, url, text (text is the extracted/translated content).
-    Returns strict JSON-shaped dict: { ticker, items: [...], token_usage, latency_ms }
+    Send batch to LLM and return parsed {'items': [...], 'ok': True, 'latency_ms': ...}
+    On error return {'items': [], 'ok': False, 'error': '...'}
     """
-    start = time.time()
-    token_usage = {"input": 0, "output": 0, "total": 0}
-    results: List[Dict] = []
+    if not batch:
+        return {"ok": True, "items": []}
 
+    # Guard: if no API key, bail early with clear error
     if not OPENAI_API_KEY:
-        print("Missing OPENAI_API_KEY, returning fallback summaries.")
-        out = [
-            {"title": i.get("title", ""), "url": i.get("url", ""), "bullets": [], "why_it_matters": "", "sentiment": "Neutral"}
-            for i in items
-        ]
-        return {"ticker": ticker, "items": out, "token_usage": token_usage, "latency_ms": int((time.time() - start) * 1000)}
+        return {"ok": False, "items": [], "error": "no_api_key", "latency_ms": 0}
 
-    # Build payload items; do NOT send raw URLs — send url_id tokens and keep mapping locally.
-    payload_items = []
-    placeholder_map = {}  # url_id -> real url
-    for idx, i in enumerate(items):
-        uid = f"URL#{idx+1}"
-        placeholder_map[uid] = i.get("url", "") or ""
-        payload_items.append({
-            "title": i.get("title", "") or "",
-            "url_id": uid,
-            "text": (i.get("text") or i.get("translated_text") or i.get("content") or "")[:8000]
-        })
-
-    # Compact JSON user payload
-    user_json = json.dumps({"items": payload_items}, ensure_ascii=False)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_json},
-    ]
-
-    req = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 700,
-    }
+    log.info("[summary] sending %d items to LLM for ticker=%s", len(batch), ticker)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    print(f"Summarizing {len(payload_items)} items …")
-    print(f"Calling OpenAI for {len(payload_items)} items...")
-    print(f"API key starts with: {os.getenv('OPENAI_API_KEY')[:10]}...")
+    # prepare messages
+    user_payload = {
+        "ticker": ticker or "",
+        "items": [
+            {"title": (i.get("title") or ""), "url": (i.get("url") or ""), "content": (i.get("translated_text") or i.get("content") or "")}
+            for i in batch
+        ],
+        "instructions": "Return JSON with key 'items' as described in system prompt."
+    }
 
-    input_tokens = _estimate_tokens(user_json) + _estimate_tokens(SYSTEM_PROMPT)
-    output_text = ""
-    parsed_items = []
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 900,
+    }
 
+    start = time.time()
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(OPENAI_URL, json=req, headers=headers)
-        if resp.status_code != 200:
-            raise Exception(f"OpenAI API error {resp.status_code}: {resp.text[:300]}")
-        data = resp.json()
-        output_text = data["choices"][0]["message"]["content"]
-
-        # Try strict JSON parse
-        try:
-            obj = json.loads(output_text)
-            parsed_items = obj.get("items", []) if isinstance(obj, dict) else []
-        except Exception:
-            print("LLM JSON parse failed; will fall back to neutral entries while preserving urls/titles")
-            parsed_items = []
-
-        # token accounting estimates
-        output_tokens = _estimate_tokens(output_text)
-        token_usage["input"] += input_tokens
-        token_usage["output"] += output_tokens
-        token_usage["total"] += input_tokens + output_tokens
-
-        # If OpenAI returns usage, log it
-        usage = data.get("usage")
-        if usage:
-            print(f"OpenAI usage: input={usage.get('prompt_tokens')}, output={usage.get('completion_tokens')}")
-        print(f"{ticker}: {input_tokens + output_tokens} tokens, est ${(input_tokens + output_tokens) / 1_000_000 * 0.15:.5f}")
-
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(OPENAI_API_URL, headers=headers, json=body)
+            latency_ms = int((time.time() - start) * 1000)
+            log.info("[summary] LLM response status=%s latency_ms=%d", resp.status_code, latency_ms)
+            # Guard non-200 explicitly
+            if resp.status_code != 200:
+                return {"ok": False, "items": [], "error": f"llm_http_{resp.status_code}", "latency_ms": latency_ms}
+            try:
+                data = resp.json()
+            except Exception:
+                log.exception("[summary] invalid json from LLM")
+                data = {}
     except Exception as e:
-        print(f"OpenAI call failed: {e}")
-        # keep parsed_items as empty to trigger neutral fallbacks below
-        parsed_items = []
-        # conservative token accounting: count input only
-        token_usage["input"] += input_tokens
-        token_usage["output"] += 0
-        token_usage["total"] += input_tokens
+        latency_ms = int((time.time() - start) * 1000)
+        log.exception("[summary] LLM request failed (latency_ms=%d)", latency_ms)
+        return {"ok": False, "error": str(e), "items": [], "latency_ms": latency_ms}
 
-    # Post-process: produce 1:1 output in input order, preserving original title/url when model misses them
-    out: List[Dict] = []
-    for idx, it in enumerate(items):
-        p = parsed_items[idx] if idx < len(parsed_items) and isinstance(parsed_items[idx], dict) else {}
-        title = p.get("title") or it.get("title", "")
-        url_id = p.get("url_id") or p.get("url") or ""  # accept url_id or url fields returned
-        url = placeholder_map.get(url_id) if url_id in placeholder_map else (it.get("url", "") or "")
-        bullets = p.get("bullets") or []
-        why = p.get("why_it_matters") or ""
-        sentiment = (p.get("sentiment") or "").capitalize()
-        sentiment = sentiment if sentiment in {"Positive", "Neutral", "Negative"} else "Neutral"
-        out.append({
+    # extract assistant text (support chat completions shape)
+    output_text = ""
+    try:
+        choices = data.get("choices") or []
+        if choices:
+            first = choices[0]
+            msg = first.get("message") or first.get("text") or {}
+            if isinstance(msg, dict):
+                output_text = msg.get("content", "") or ""
+            else:
+                output_text = str(msg or "")
+    except Exception:
+        output_text = ""
+
+    if not output_text.strip():
+        log.info("[summary] empty assistant content")
+    else:
+        log.info("[summary] raw assistant content (first 400 chars): %s", output_text[:400])
+
+    # permissive JSON parsing with fallbacks
+    parsed: List[Dict[str, Any]] = []
+    try:
+        obj = json.loads(output_text)
+        if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+            parsed = obj["items"]
+        elif isinstance(obj, list):
+            parsed = obj
+    except Exception as e:
+        # try stripping fences and common wrappers
+        try:
+            txt = output_text.strip()
+            for fence in ("```json", "```"):
+                if txt.startswith(fence):
+                    txt = txt[len(fence):].strip()
+            if txt.endswith("```"):
+                txt = txt[:-3].strip()
+            obj = json.loads(txt)
+            if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+                parsed = obj["items"]
+            elif isinstance(obj, list):
+                parsed = obj
+        except Exception:
+            # last resort: slice from first '{' to last '}' and retry
+            try:
+                start_i = output_text.find("{")
+                end_i = output_text.rfind("}")
+                if start_i != -1 and end_i != -1 and end_i > start_i:
+                    obj = json.loads(output_text[start_i:end_i + 1])
+                    if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+                        parsed = obj["items"]
+            except Exception:
+                log.exception("[summary] parse FAILED")
+                parsed = []
+
+    # If parsed empty, keep existing behavior: return ok=False and include assistant preview
+    if not parsed:
+        log.info("[summary] parsed items empty; assistant preview (first 400): %s", output_text[:400])
+        return {"ok": False, "error": "empty_parsed", "items": [], "latency_ms": int((time.time() - start) * 1000)}
+
+    # Final normalization: ensure sentiment field exists and short paragraph present
+    normalized = []
+    for it in parsed:
+        title = it.get("title") or ""
+        why = it.get("why_it_matters") or it.get("summary") or ""
+        bullets = it.get("bullets") or []
+        sentiment = (it.get("sentiment") or "").strip()
+        if not sentiment:
+            # try to extract from raw text sentiment line
+            s = ""
+            if isinstance(why, str) and "Sentiment:" in why:
+                try:
+                    s = why.split("Sentiment:")[-1].strip().split()[0]
+                except Exception:
+                    s = ""
+            sentiment = s or "Neutral"
+        normalized.append({
             "title": title,
-            "url": url,
-            "bullets": bullets[:3],
+            "bullets": bullets if isinstance(bullets, list) else [],
             "why_it_matters": why,
-            "sentiment": sentiment
+            "sentiment": sentiment,
         })
 
-    latency_ms = int((time.time() - start) * 1000)
-    return {"ticker": ticker, "items": out, "token_usage": token_usage, "latency_ms": latency_ms}
+    total_latency = int((time.time() - start) * 1000)
+    return {"ok": True, "items": normalized, "latency_ms": total_latency}
