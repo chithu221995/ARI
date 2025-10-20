@@ -48,3 +48,37 @@ Copy .env.example to .env and fill in secrets before running. Key env vars:
 - SUMMARY_DRY_RUN: Whether summaries default to dry-run.
 - EMAIL_PROVIDER / SENDGRID_API_KEY / EMAIL_FROM / EMAIL_TO: Email configuration.
 - CACHE_DB / CACHE_TTL_DAYS: Local cache DB and TTL.
+
+## MVP Setup
+
+- Prereqs
+  - Python 3.11+
+  - git, curl (optional)
+  - recommended: use a virtualenv
+
+- Installation
+  - python -m venv .venv
+  - source .venv/bin/activate
+  - pip install -r requirements.txt
+
+- Environment
+  - cp .env.example .env
+  - Edit .env and fill keys (NEWS_API_KEY, OPENAI_API_KEY, SENDGRID_API_KEY, EMAIL_FROM, etc.)
+
+- Run (development)
+  - uvicorn main:app --reload
+
+- Useful endpoints
+  - OpenAPI UI: /docs
+  - POST /api/v1/brief
+  - GET/POST /api/v1/summarize
+  - POST /admin/email/brief
+  - GET /debug/healthz
+
+- Scheduler / Cron
+  - Cron schedules are read from CRON_PREFETCH and CRON_SUMMARIZE (interpreted in Asia/Kolkata / IST).
+  - TTL purge runs per CRON_PURGE (IST).
+
+- Email: dry-run vs real send
+  - The email brief endpoint supports a dry_run flag (true by default) to preview content without sending.
+  - To send real email set dry_run=false and ensure SENDGRID_API_KEY and EMAIL_FROM are configured and verified.

@@ -1,133 +1,103 @@
 from __future__ import annotations
 import os
-import hashlib
 import aiosqlite
 import datetime
+import hashlib
+import logging
+import json
 from typing import List, Dict, Optional, Any, Tuple
 
-CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "ari_cache.db")
-CACHE_DB = os.getenv("CACHE_DB", "cache.db")
+log = logging.getLogger("ari.cache")
+
+# how many days to keep cache rows
 CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "7"))
+
+# canonical DB path used by this module
+CACHE_DB_PATH = os.getenv("SQLITE_PATH", "./ari.db")
+
+async def get_db():
+    """Return an aiosqlite connection to the canonical DB used by the app."""
+    return await aiosqlite.connect(CACHE_DB_PATH)
 
 
 async def open_db():
     return await aiosqlite.connect(CACHE_DB_PATH)
 
 
-async def init_db() -> None:
-    """
-    Initialize DB and run lightweight migrations ensuring expected columns (including 'lang' on articles).
-    """
-    db_path = CACHE_DB_PATH
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-
+async def init_db():
+    async with aiosqlite.connect(CACHE_DB_PATH) as db:
+        # existing create table statements for articles
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT,
-                url TEXT,
+                url TEXT PRIMARY KEY,
                 url_hash TEXT,
                 title TEXT,
-                source TEXT,
-                published_at TEXT,
-                content TEXT,
-                translated_text TEXT,
-                lang TEXT DEFAULT 'en',
-                created_at TEXT
-            )
-            """
-        )
-
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS filings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker TEXT,
-                url TEXT,
-                url_hash TEXT,
-                title TEXT,
                 source TEXT,
-                category TEXT,
                 published_at TEXT,
+                lang TEXT,
                 content TEXT,
                 created_at TEXT
             )
             """
         )
 
+        # ensure summaries table has the desired schema (idempotent)
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS summaries (
                 item_url_hash TEXT PRIMARY KEY,
-                ticker TEXT,
+                ticker TEXT NOT NULL,
                 title TEXT,
-                bullets_json TEXT,
+                url TEXT,
+                bullets TEXT,
                 why_it_matters TEXT,
                 sentiment TEXT,
-                created_at TEXT
+                created_at TEXT NOT NULL DEFAULT (datetime('now','utc'))
             )
             """
         )
-
         await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS usage_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT,
-                model TEXT,
-                prompt_tokens INTEGER,
-                completion_tokens INTEGER,
-                cost_usd REAL
-            )
-            """
+            "CREATE INDEX IF NOT EXISTS idx_summaries_ticker_created ON summaries(ticker, created_at)"
         )
+        log.info("cache.init_db: summaries table ensured")
 
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_email TEXT,
-                ticker TEXT,
-                date TEXT,
-                news_score INTEGER,
-                filings_score INTEGER,
-                overall_score INTEGER,
-                comments TEXT,
-                created_at TEXT
-            )
-            """
-        )
+        # --- existing schema patches for articles/summaries (kept as-is) ---
+        # enable WAL for safer concurrency
+        try:
+            await db.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE summaries ADD COLUMN title TEXT DEFAULT ''")
+            log.info("cache.init_db: added summaries.title column")
+        except Exception:
+            log.debug("cache.init_db: summaries.title exists or ALTER failed", exc_info=False)
+
+        try:
+            await db.execute("ALTER TABLE articles ADD COLUMN translated_text TEXT DEFAULT ''")
+            log.info("cache.init_db: added articles.translated_text column")
+        except Exception:
+            log.debug("cache.init_db: articles.translated_text exists or ALTER failed", exc_info=False)
+
+        # add text_hash if missing (idempotent)
+        try:
+            await db.execute("ALTER TABLE articles ADD COLUMN text_hash TEXT DEFAULT ''")
+            log.info("cache.init_db: added articles.text_hash column")
+        except Exception:
+            log.debug("cache.init_db: articles.text_hash exists or ALTER failed", exc_info=False)
+
+        # ensure helpful indexes exist
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_articles_ticker_created ON articles(ticker, created_at)")
+            await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_urlhash ON articles(url_hash)")
+            log.info("cache.init_db: ensured indexes idx_articles_ticker_created and idx_articles_urlhash")
+        except Exception:
+            log.debug("cache.init_db: index creation failed (ignored)", exc_info=False)
 
         await db.commit()
-
-        # Ensure 'lang' column exists on articles table (idempotent)
-        async with db.execute("PRAGMA table_info(articles);") as cur:
-            rows = await cur.fetchall()
-            existing = {r[1] for r in rows}
-        if "lang" not in existing:
-            try:
-                await db.execute("ALTER TABLE articles ADD COLUMN lang TEXT DEFAULT 'en';")
-                await db.commit()
-            except Exception:
-                pass
-
-        # Normalize NULL/empty langs to 'en' (best-effort)
-        try:
-            await db.execute("UPDATE articles SET lang='en' WHERE lang IS NULL OR TRIM(lang) = ''")
-            await db.commit()
-        except Exception:
-            pass
-
-        # ensure indices
-        try:
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_articles_ticker ON articles(ticker);")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_summaries_ticker ON summaries(ticker);")
-            await db.commit()
-        except Exception:
-            pass
 
 
 def now_iso() -> str:
@@ -151,51 +121,68 @@ def url_to_hash(url: str) -> str:
 
 
 # New helpers for upserting and reading cached items (news/articles and filings)
-async def cache_upsert_items(items: List[Dict[str, Any]], *, kind: str = "news", ticker: str) -> int:
+async def cache_upsert_items(rows: List[Dict[str, Any]], ticker: Optional[str] = None) -> int:
     """
-    Upsert items into cache. Prototype is news-only:
-    - If kind != "news", do nothing (filings removed in prototype).
+    Upsert article rows into articles table.
     """
-    if not items:
+    if not rows:
         return 0
-    if kind != "news":
-        # filings removed in prototype
-        return 0
-
-    inserted = 0
-    db_path = CACHE_DB_PATH
-    async with aiosqlite.connect(db_path) as db:
-        for it in items:
-            url = (it.get("url") or "").strip()
-            url_hash_val = url_to_hash(url)
-            title = it.get("title") or ""
-            source = it.get("source") or ""
-            published_at = it.get("published_at") or it.get("publishedAt") or ""
-            content = it.get("content") or it.get("translated_text") or ""
-            lang = it.get("lang") or "en"
-
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO articles
-                (ticker, url, url_hash, title, source, published_at, content, translated_text, lang, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    ticker,
-                    url,
-                    url_hash_val,
-                    title,
-                    source,
-                    published_at,
-                    content,
-                    it.get("translated_text") or None,
-                    lang,
-                    now_iso(),
-                ),
-            )
-            inserted += 1
+    async with aiosqlite.connect(CACHE_DB_PATH) as db:
+        async with db.execute("BEGIN"):
+            stmt = """
+            INSERT INTO articles
+                (url, url_hash, title, ticker, source, published_at, lang, content, text_hash, created_at, translated_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+                 url_hash=excluded.url_hash,
+                 title=excluded.title,
+                 ticker=excluded.ticker,
+                 source=excluded.source,
+                 published_at=excluded.published_at,
+                 lang=excluded.lang,
+                 content=excluded.content,
+                 text_hash=excluded.text_hash,
+                 created_at=excluded.created_at,
+                 translated_text=excluded.translated_text
+            """
+            cnt = 0
+            log.debug("[cache] upserting %d article rows for ticker=%s", len(rows), ticker)
+            for r in rows:
+                vals = (
+                    r.get("url"),
+                    r.get("url_hash"),
+                    r.get("title", "") or "",
+                    r.get("ticker", "") or ticker or "",
+                    r.get("source", "") or "",
+                    r.get("published_at", "") or "",
+                    r.get("lang", "en") or "en",
+                    r.get("content", "") or "",
+                    r.get("text_hash", "") or "",
+                    r.get("created_at") or now_iso(),
+                    r.get("translated_text", "") or "",
+                )
+                try:
+                    await db.execute(stmt, vals)
+                    cnt += 1
+                except Exception as e:
+                    log.error("[cache] upsert articles failed: %s", e, exc_info=True)
+                    # fallback: INSERT OR REPLACE when conflict-target mismatch or other issues
+                    if "ON CONFLICT" in str(e) or "conflict" in str(e).lower():
+                        fallback_stmt = """
+                          INSERT OR REPLACE INTO articles
+                            (url, url_hash, title, ticker, source, published_at, lang, content, text_hash, created_at, translated_text)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                        try:
+                            await db.execute(fallback_stmt, vals)
+                            cnt += 1
+                        except Exception as fe:
+                            log.error("[cache] fallback REPLACE failed: %s", fe, exc_info=True)
+                            raise
+                    else:
+                        raise
         await db.commit()
-    return inserted
+    return cnt
 
 
 async def cache_get_by_ticker(ticker: str, *, max_age_hours: int = 24) -> Dict[str, Any]:
@@ -233,43 +220,59 @@ async def cache_get_by_ticker(ticker: str, *, max_age_hours: int = 24) -> Dict[s
     return out
 
 
-async def cache_upsert_summaries(summaries: List[Dict[str, Any]]) -> int:
+async def cache_upsert_summaries(rows: List[Dict[str, Any]]) -> int:
     """
-    Upsert a list of summaries into the summaries table.
-    Returns number of rows inserted/updated.
+    Upsert summary rows using INSERT OR REPLACE.
+    Accepts rows with keys: item_url_hash (optional), url (optional), ticker, title, bullets or bullets_json, why_it_matters, sentiment
     """
-    if not summaries:
+    if not rows:
         return 0
-    inserted = 0
-    db_path = CACHE_DB_PATH
-    async with aiosqlite.connect(db_path) as db:
-        for it in summaries:
-            item_url_hash = (it.get("item_url_hash") or "").strip()
-            ticker = it.get("ticker") or ""
-            title = it.get("title") or ""
-            bullets_json = it.get("bullets_json") or ""
-            why_it_matters = it.get("why_it_matters") or ""
-            sentiment = it.get("sentiment") or "Neutral"
 
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO summaries
-                (item_url_hash, ticker, title, bullets_json, why_it_matters, sentiment, created_at)
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    item_url_hash,
-                    ticker,
-                    title,
-                    bullets_json,
-                    why_it_matters,
-                    sentiment,
-                    now_iso(),
-                ),
-            )
-            inserted += 1
+    stmt = """
+    INSERT OR REPLACE INTO summaries
+      (item_url_hash, ticker, title, url, bullets, why_it_matters, sentiment, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    upserted = 0
+    log.debug("[cache] upserting %d summaries", len(rows))
+
+    async with aiosqlite.connect(CACHE_DB_PATH) as db:
+        async with db.execute("BEGIN"):
+            for r in rows:
+                url = (r.get("url") or "").strip()
+                item_hash = r.get("item_url_hash") or url_hash(url)
+                bullets_val = r.get("bullets") if "bullets" in r else r.get("bullets_json", "[]")
+                try:
+                    if isinstance(bullets_val, list):
+                        bullets_str = json.dumps(bullets_val)
+                    else:
+                        bullets_str = bullets_val or "[]"
+                except Exception:
+                    bullets_str = "[]"
+
+                vals = (
+                    item_hash,
+                    r.get("ticker") or "",
+                    r.get("title") or "",
+                    url,
+                    bullets_str,
+                    r.get("why_it_matters") or "",
+                    r.get("sentiment") or "Neutral",
+                    r.get("created_at") or now_iso(),
+                )
+
+                try:
+                    await db.execute(stmt, vals)
+                    upserted += 1
+                except Exception as e:
+                    log.error("[cache] upsert summary failed for url/hash=%s/%s: %s", url or "", item_hash, e, exc_info=True)
+                    # continue with next row (do not abort the batch)
+                    continue
         await db.commit()
-    return inserted
+
+    log.info("[cache] upserted %d summaries", upserted)
+    return upserted
 
 
 async def cache_get_summaries_map(conn: aiosqlite.Connection, url_hashes: List[str]) -> Dict[str, Dict]:
@@ -415,7 +418,7 @@ async def purge_expired(now_utc: datetime.datetime | None = None) -> Tuple[int,i
     cutoff = (now_utc or datetime.datetime.utcnow()) - datetime.timedelta(days=CACHE_TTL_DAYS)
     cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
     a = s = f = 0
-    async with aiosqlite.connect(CACHE_DB) as db:
+    async with aiosqlite.connect(CACHE_DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         # articles
         try:
@@ -439,19 +442,95 @@ async def purge_expired(now_utc: datetime.datetime | None = None) -> Tuple[int,i
     return a, s, f
 
 
+async def _db_path() -> str:
+    return os.getenv("SQLITE_PATH", "./ari.db")
+
+
+async def _table_exists(db: aiosqlite.Connection, name: str) -> bool:
+    try:
+        cur = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return bool(row)
+    except Exception:
+        return False
+
+
+async def count_articles_rows() -> int:
+    try:
+        async with aiosqlite.connect(await _db_path()) as db:
+            if not await _table_exists(db, "articles"):
+                return 0
+            cur = await db.execute("SELECT COUNT(*) FROM articles")
+            row = await cur.fetchone()
+            await cur.close()
+            return int(row[0] if row else 0)
+    except Exception as e:
+        log.exception("count_articles_rows failed: %s", e)
+        return 0
+
+
+async def count_summaries_rows() -> int:
+    try:
+        async with aiosqlite.connect(await _db_path()) as db:
+            if not await _table_exists(db, "summaries"):
+                return 0
+            cur = await db.execute("SELECT COUNT(*) FROM summaries")
+            row = await cur.fetchone()
+            await cur.close()
+            return int(row[0] if row else 0)
+    except Exception as e:
+        log.exception("count_summaries_rows failed: %s", e)
+        return 0
+
+
+META_CREATE_SQL = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
+
+async def set_meta(key: str, value: str) -> None:
+    try:
+        async with aiosqlite.connect(await _db_path()) as db:
+            await db.execute(META_CREATE_SQL)
+            await db.execute(
+                "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (key, value),
+            )
+            await db.commit()
+    except Exception:
+        log.exception("set_meta failed for key=%s", key)
+
+async def get_meta(key: str) -> Optional[str]:
+    try:
+        async with aiosqlite.connect(await _db_path()) as db:
+            await db.execute(META_CREATE_SQL)
+            cur = await db.execute("SELECT v FROM meta WHERE k=?", (key,))
+            row = await cur.fetchone()
+            await cur.close()
+            return row[0] if row else None
+    except Exception:
+        log.exception("get_meta failed for key=%s", key)
+        return None
+
+# single canonical export list
 __all__ = [
     "open_db",
     "init_db",
     "now_iso",
     "sha256_16",
     "url_hash",
+    "url_to_hash",
     "cache_upsert_items",
     "cache_get_by_ticker",
     "cache_upsert_summaries",
     "cache_get_summaries_map",
+    "cache_get_missing_items_for_summary",
     "cache_stats",
     "purge_ticker",
     "purge_older_than",
-    "cache_get_missing_items_for_summary",
     "purge_expired",
+    "count_articles_rows",
+    "count_summaries_rows",
+    "set_meta",
+    "get_meta",
 ]
