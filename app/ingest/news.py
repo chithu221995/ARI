@@ -1,150 +1,132 @@
-# app/ingest/news.py
 from __future__ import annotations
 import os
 import logging
-from typing import List, Dict, Any, Optional
-import datetime
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
 import httpx
-import re
 
-log = logging.getLogger("ari.ingest.news")
+from app.core import settings
+from app.core.cache import url_hash
 
-# endpoint / constants
-NEWS_API_URL = "https://newsapi.org/v2/everything"
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
+log = logging.getLogger("ari.news")
 
-def build_news_query(ticker: str) -> str:
-    """Return a safe query string for newsapi."""
-    t = (ticker or "").strip()
-    if not t:
-        return ""
-    return f'{t} OR "{t} stock"'
 
-async def fetch_news_for_ticker(ticker: str, max_items: int = 5, days: int = 7) -> List[Dict[str, Any]]:
+def _dequery_url(u: str) -> str:
+    try:
+        p = urlparse((u or "").strip())
+        if not p.scheme:
+            return u
+        # remove common tracking params
+        q = parse_qsl(p.query, keep_blank_values=True)
+        filtered = [(k, v) for k, v in q if not k.lower().startswith("utm_") and k.lower() not in ("fbclid", "gclid", "icn")]
+        new_q = urlencode(filtered, doseq=True)
+        return urlunparse((p.scheme, p.netloc, p.path or "", p.params or "", new_q, p.fragment or ""))
+    except Exception:
+        return u
+
+
+# Try to use a resolve helper if present; otherwise fallback
+try:
+    from app.core.lookup import resolve  # type: ignore
+except Exception:
+    def resolve(ticker: str) -> Dict[str, List[str]]:
+        # minimal fallback: return ticker as symbol and no aliases
+        return {"name": ticker, "aliases": [], "nse": ticker}
+
+
+async def fetch_news_for_ticker(ticker: str, max_items: int = 20, days: int = 7) -> List[Dict]:
     """
-    Fetch news for a ticker from NewsAPI.org.
-    - uses NEWS_API_URL and NEWS_API_KEY
-    - language='en', sortBy='publishedAt', pageSize up to max(5,10)
-    - from = days ago (ISO)
-    - returns list of dicts: {title, url, published_at, source, content}
-    - logs info on start and logs errors on exceptions; never raises NameError for NEWS_API_URL.
+    Fetch news for ticker using NewsAPI /v2/everything.
+    Builds q from resolve(ticker) (name + aliases + nse symbol OR-joined).
+    Returns list of dicts with keys: title, url, published_at, source, lang='en'
     """
-    if not ticker:
+    key = os.getenv("NEWS_API_KEY", "") or getattr(settings, "NEWS_API_KEY", "")
+    if not key:
+        log.info("news.fetch_news_for_ticker: NEWS_API_KEY missing, skipping NewsAPI for %s", ticker)
         return []
 
-    log.info("ingest.news: fetch_news_for_ticker start ticker=%s max_items=%s days=%s", ticker, max_items, days)
+    info = resolve(ticker) or {}
+    parts: List[str] = []
+    name = info.get("name") or ""
+    if name:
+        parts.append(f"\"{name}\"" if " " in name else name)
+    for a in info.get("aliases", []) or []:
+        if a:
+            parts.append(f"\"{a}\"" if " " in a else a)
+    nse = info.get("nse") or info.get("symbol") or ""
+    if nse:
+        parts.append(nse)
 
-    q = build_news_query(ticker)
-    now = datetime.datetime.utcnow()
-    from_dt = now - datetime.timedelta(days=days)
-    from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    q = " OR ".join(parts) if parts else ticker
 
-    page_size = max(max_items, 10)
+    now = datetime.utcnow()
+    to_iso = now.replace(microsecond=0).isoformat() + "Z"
+    from_iso = (now - timedelta(days=days)).replace(microsecond=0).isoformat() + "Z"
 
+    endpoint = "https://newsapi.org/v2/everything"
     params = {
         "q": q,
         "language": "en",
-        "sortBy": "publishedAt",
-        "pageSize": page_size,
+        "sortBy": "relevancy",
         "from": from_iso,
+        "to": to_iso,
+        "pageSize": 25,
     }
-    headers = {}
-    # prefer header if key present
-    if NEWS_API_KEY:
-        headers["X-Api-Key"] = NEWS_API_KEY
-        params["apiKey"] = NEWS_API_KEY  # fallback; some clients expect param
+    headers = {"X-Api-Key": key}
 
-    out: List[Dict[str, Any]] = []
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(NEWS_API_URL, params=params, headers=headers)
+        async with httpx.AsyncClient(timeout=settings.NEWS_TIMEOUT_S or 10) as client:
+            r = await client.get(endpoint, params=params, headers=headers)
             if r.status_code != 200:
-                log.error("ingest.news: newsapi non-200 status=%s text=%s", r.status_code, r.text[:200])
+                log.warning("news.fetch_news_for_ticker: non-200 for %s status=%d text=%s", ticker, r.status_code, r.text[:200])
                 return []
             data = r.json()
-            articles = data.get("articles") or []
-            for a in articles:
-                if len(out) >= max_items:
-                    break
-                # prefer explicit publishedAt field
-                title = a.get("title") or ""
-                url = a.get("url") or ""
-                published_at = a.get("publishedAt") or a.get("published_at") or ""
-                source = (a.get("source") or {}).get("name") if isinstance(a.get("source"), dict) else a.get("source") or ""
-                content = a.get("content") or a.get("description") or ""
-                # filter language: NewsAPI should honor language param, but double-check if article carries a language key
-                lang = a.get("language") or ""
-                if lang and lang.lower() != "en":
-                    continue
-                out.append({
-                    "title": title,
-                    "url": url,
-                    "published_at": published_at,
-                    "source": source,
-                    "content": content,
-                })
-    except Exception as e:
-        log.exception("ingest.news: fetch_news_for_ticker failed for %s: %s", ticker, e)
-        return []
-
-    return out
-
-def _parse_published(s: str) -> datetime.datetime:
-    if not s:
-        return datetime.datetime.fromtimestamp(0)
-    try:
-        if s.endswith("Z"):
-            return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
-        return datetime.datetime.fromisoformat(s)
     except Exception:
-        try:
-            return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return datetime.datetime.fromtimestamp(0)
-
-
-def select_top_news_for_summary(items: List[Dict[str, Any]], k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Return up to k items suitable for summarization:
-    - prefer English items (lang == 'en' if present)
-    - dedupe by url/title
-    - sort by published_at (newest first) when available
-    """
-    if not items:
+        log.exception("news.fetch_news_for_ticker: request failed for %s", ticker)
         return []
 
-    seen_urls = set()
-    seen_titles = set()
-    cleaned: List[Dict[str, Any]] = []
-
-    # normalize and filter
-    for it in items:
-        title = (it.get("title") or "").strip()
-        url = (it.get("url") or "").strip()
-        lang = (it.get("lang") or "").strip().lower()
-        # prefer english if lang present
-        if lang and lang != "en":
+    articles = data.get("articles") or []
+    out: List[Dict] = []
+    seen_hashes = set()
+    for a in articles:
+        url = (a.get("url") or "").strip()
+        if not url:
             continue
-        key_url = url.lower()
-        key_title = re.sub(r"\s+", " ", title.lower())
-        if key_url and key_url in seen_urls:
+        url_norm = _dequery_url(url)
+        h = url_hash(url_norm)
+        if h in seen_hashes:
             continue
-        if key_title and key_title in seen_titles:
-            continue
-        if key_url:
-            seen_urls.add(key_url)
-        if key_title:
-            seen_titles.add(key_title)
-        cleaned.append({**it, "published_parsed": _parse_published(it.get("published_at") or it.get("publishedAt") or "")})
-
-    # sort by parsed published date desc, keep original order as fallback
-    cleaned.sort(key=lambda x: x.get("published_parsed", datetime.datetime.fromtimestamp(0)), reverse=True)
-
-    # return up to k, strip helper key before returning
-    out = []
-    for c in cleaned:
-        c.pop("published_parsed", None)
-        out.append(c)
-        if len(out) >= k:
+        seen_hashes.add(h)
+        itm = {
+            "title": a.get("title") or "",
+            "url": url_norm,
+            "published_at": a.get("publishedAt") or a.get("published_at") or "",
+            "source": (a.get("source") or {}).get("name") if isinstance(a.get("source"), dict) else a.get("source") or "",
+            "lang": "en",
+        }
+        out.append(itm)
+        if len(out) >= max_items:
             break
+
     return out
+
+
+async def select_top_news_for_summary(ticker: str, max_items: int = 5, days: int = 7) -> List[Dict]:
+    """
+    Backwards-compatible helper used by other modules.
+    Returns the top news items suitable for summarization (delegates to fetch_news_for_ticker).
+    """
+    try:
+        items = await fetch_news_for_ticker(ticker, max_items=max_items, days=days)
+        return items[:max_items]
+    except Exception:
+        log.exception("select_top_news_for_summary failed for %s", ticker)
+        return []
+
+# ensure it's exported if __all__ is used
+try:
+    __all__.append("select_top_news_for_summary")
+except Exception:
+    __all__ = ["fetch_news_for_ticker", "select_top_news_for_summary"]

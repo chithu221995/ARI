@@ -11,6 +11,16 @@ from typing import List, Dict, Any, Optional
 
 import aiosqlite
 import httpx
+import trafilatura
+import re
+# try to use existing detect_language helper if available
+try:
+    from app.core.lang import detect_language
+except Exception:
+    def detect_language(text: str) -> str:
+        # best-effort fallback: assume English
+        return "en"
+
 from app.core.cache import (
     CACHE_DB_PATH,
     url_hash,
@@ -20,7 +30,7 @@ from app.core.cache import (
     set_meta,
 )
 from app.summarize.llm import summarize_items
-from app.ingest.news import fetch_news_for_ticker
+from app.ingest.fusion import fetch_fused_news
 
 from fastapi import APIRouter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -60,8 +70,8 @@ async def job_prefetch(tickers: Optional[list[str]] = None):
         for t in tickers:
             items_for_ticker: list[dict] = []
             try:
-                # fetch recent news for this ticker (7-day window)
-                items_for_ticker = await fetch_news_for_ticker(t, max_items=20, days=7)
+                # fetch fused news for this ticker (uses configured sources & filters)
+                items_for_ticker = await fetch_fused_news(t)
                 processed += 1
             except Exception:
                 log.exception("[jobs] prefetch: fetch_news_for_ticker failed for %s", t)
@@ -158,9 +168,10 @@ async def job_summarize(tickers: Optional[list[str]] = None):
                 log.exception("[jobs] summarize: DB candidate load failed for %s", t)
                 continue
 
-            # enrich with article text when missing
+            # enrich with article text when missing and enforce minimum length
             items_for_llm: List[Dict[str, Any]] = []
             for c in candidates:
+                # ensure we have translated_text (try fetch if missing)
                 if not (c.get("translated_text") or "").strip():
                     try:
                         art = await fetch_article_text(c.get("url") or "")
@@ -168,14 +179,18 @@ async def job_summarize(tickers: Optional[list[str]] = None):
                         c["lang"] = art.get("lang") or c.get("lang")
                     except Exception:
                         c["translated_text"] = c.get("translated_text") or ""
-                if not c.get("translated_text"):
-                    # skip items with no usable text
+
+                # skip if still empty or too short to summarize
+                txt = (c.get("translated_text") or "").strip()
+                if not txt or len(txt) < 400:
+                    # too short or no text — skip
                     continue
+
                 items_for_llm.append(
                     {
                         "title": c.get("title") or "",
                         "url": c.get("url") or "",
-                        "translated_text": c.get("translated_text") or "",
+                        "translated_text": txt,
                         "source": c.get("source") or "",
                         "category": "NEWS",
                         "published_at": c.get("published_at") or "",
@@ -183,11 +198,10 @@ async def job_summarize(tickers: Optional[list[str]] = None):
                     }
                 )
 
-            # enforce translated_text truthiness and skip empty batches
-            items_for_llm = [it for it in items_for_llm if (it.get("translated_text") or "").strip()]
+            # log counts: total candidates loaded vs items we'll send to the LLM
             log.info("[jobs] summarize: %s candidates=%d will_send=%d", t, len(candidates), len(items_for_llm))
             if not items_for_llm:
-                log.info("[jobs] summarize: %s no items with translated_text, skipping", t)
+                log.info("[jobs] summarize: %s no items meeting length/availability criteria, skipping", t)
                 continue
 
             # call LLM
@@ -552,23 +566,67 @@ async def purge_expired(ttl_days: int = 7):
 async def fetch_article_text(url: str) -> dict:
     """
     Minimal text fetcher for summarize job.
-    Returns {"translated_text": <string>, "lang": "en"}.
-    Keep it simple: download, strip HTML tags crudely, best-effort.
+    Returns {"translated_text": <string>, "lang": "en", "chars": <int>}.
+    - Uses httpx AsyncClient with UA
+    - Streams up to 1.5MB, extracts main text with trafilatura, fallback to stripping tags
+    - Detects language via detect_language(); non-'en' yields empty translated_text
     """
     if not url:
-        return {"translated_text": "", "lang": "en"}
+        return {"translated_text": "", "lang": "en", "chars": 0}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url, follow_redirects=True)
-            html = r.text or ""
-        # super-simple fallback: remove tags
-        import re
+        headers = {"User-Agent": "ARI-NewsFetcher/1.0"}
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return {"translated_text": "", "lang": "en", "chars": 0}
+            ctype = r.headers.get("content-type", "") or ""
+            if "text/html" not in ctype.lower():
+                return {"translated_text": "", "lang": "en", "chars": 0}
 
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = " ".join(text.split())
-        return {"translated_text": text[:15000], "lang": "en"}
+            limit = 1_500_000  # 1.5 MB
+            chunks = []
+            size = 0
+            async for chunk in r.aiter_bytes():
+                if not chunk:
+                    break
+                need = limit - size
+                if need <= 0:
+                    break
+                if len(chunk) > need:
+                    chunks.append(chunk[:need])
+                    size += need
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            raw = b"".join(chunks)
+            try:
+                html = raw.decode("utf-8", errors="replace")
+            except Exception:
+                html = raw.decode("latin1", errors="replace")
+
+        # try trafilatura extraction
+        try:
+            text = trafilatura.extract(html, include_comments=False, include_tables=False, include_formatting=False) or ""
+        except Exception:
+            text = ""
+
+        if not text:
+            # fallback crude tag-stripping
+            text = re.sub(r"<[^>]+>", " ", html)
+            text = " ".join(text.split())
+
+        chars = len(text or "")
+        try:
+            lang = detect_language(text or "")
+        except Exception:
+            lang = "en"
+
+        if (lang or "").lower() != "en":
+            return {"translated_text": "", "lang": lang, "chars": chars}
+
+        return {"translated_text": (text or "")[:15000], "lang": "en", "chars": chars}
     except Exception:
-        return {"translated_text": "", "lang": "en"}
+        return {"translated_text": "", "lang": "en", "chars": 0}
 
 
 # ensure symbols export
