@@ -98,3 +98,84 @@ async def summarize_cached_and_upsert(app, ticker: str) -> Dict[str, Any]:
             print(f"[summarize_job] cache_upsert_summaries failed for {ticker}: {e}")
 
     return {"ticker": ticker, "summarized": total_summarized, "skipped": total_skipped}
+
+    async def _waterfall_refill(ticker: str, all_articles: list[dict], current_items: list[dict], *,
+                                 min_usable: int = 3, hard_limit: int = 7) -> tuple[list[dict], int]:
+        """
+        Ensure we have at least `min_usable` usable summaries (relevance > 1) by fetching
+        up to `hard_limit` total articles and summarizing any newly fetched ones.
+        Returns (merged_items, fetched_extra_count).
+        """
+        try:
+            usable = [i for i in current_items if int(i.get("relevance", 0) or 0) > 1]
+        except Exception:
+            usable = []
+
+        if len(usable) >= min_usable:
+            return current_items, 0
+
+        if len(all_articles) >= hard_limit:
+            return current_items, 0
+
+        extra_needed = min(hard_limit - len(all_articles), hard_limit)  # conservative upper bound
+        fetched_extra = []
+        try:
+            # try to fetch more articles using the fused news helper
+            from app.ingest.fusion import fetch_fused_news
+            # fetch up to extra_needed (may return duplicates/newer items)
+            fetched_extra = await fetch_fused_news(ticker, top_k=extra_needed, days=7)
+        except Exception:
+            try:
+                # best-effort fallback to any other fetcher if available
+                from app.ingest.news import fetch as fetch_news  # type: ignore
+                fetched_extra = await fetch_news(ticker, days=7, top_k=extra_needed)
+            except Exception:
+                log.exception("waterfall: failed to fetch extra articles for %s", ticker)
+                fetched_extra = []
+
+        # dedupe by URL against existing all_articles
+        seen_urls = {a.get("url") for a in all_articles if a.get("url")}
+        new_articles = [a for a in (fetched_extra or []) if a.get("url") and a.get("url") not in seen_urls][:extra_needed]
+        if not new_articles:
+            return current_items, 0
+
+        # run summarizer only on newly fetched articles
+        try:
+            new_summary_resp = await summarize_items(new_articles, ticker=ticker)
+            new_items = new_summary_resp.get("items") if isinstance(new_summary_resp, dict) else []
+        except Exception:
+            log.exception("waterfall: summarize_items failed for additional articles")
+            new_items = []
+
+        # merge keeping original order, avoiding duplicate URLs
+        merged: list[dict] = []
+        seen = set()
+        for it in (current_items or []) + (new_items or []):
+            u = (it or {}).get("url") or ""
+            if u and u in seen:
+                continue
+            merged.append(it)
+            if u:
+                seen.add(u)
+
+        pre = len([x for x in (current_items or []) if int((x.get("relevance") or 0) or 0) > 1])
+        post = len([x for x in merged if int((x.get("relevance") or 0) or 0) > 1])
+        fetched = len(new_articles)
+        log.info("waterfall: pre=%d usable, post=%d usable, fetched=%d extra", pre, post, fetched)
+
+        return merged, fetched
+
+    # ...existing code that calls summarize_items() ...
+    # Example integration point (adjust variable names to match your function):
+    # assume `all_articles` is the list of article dicts you passed into summarize_items,
+    # and `summary_resp` is the dict returned by summarize_items(...)
+    try:
+        summary_resp = await summarize_items(all_articles, ticker=ticker)
+        items = summary_resp.get("items") or []
+        # attempt waterfall refill if needed
+        merged_items, extra_fetched = await _waterfall_refill(ticker, all_articles, items)
+        # write merged_items back into the response structure used by the job
+        if isinstance(summary_resp, dict):
+            summary_resp["items"] = merged_items
+    except Exception:
+        log.exception("summarize job: initial summarize_items failed for %s", ticker)

@@ -1,11 +1,15 @@
-# filepath: /Users/chitharanjan/ARI/main.py
 from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
 
 import logging
-from app.core.cache import init_db
-log = logging.getLogger("ari.main")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+from fastapi import FastAPI
+from app.api import router as api_router
+
+app = FastAPI(title="ARI")
+app.include_router(api_router)
 
 # (startup handler must be registered after app = FastAPI())
 # (moved further down)
@@ -16,49 +20,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 from fastapi import FastAPI
 import traceback
 
+# import composed admin package (single admin router)
+from app.api.admin import admin as admin_pkg
+# create the FastAPI app before mounting routers
 app = FastAPI(title="A.R.I. Engine")
-
-# register DB init on startup (must run after app exists)
-@app.on_event("startup")
-async def _startup_init_db() -> None:
-    try:
-        log.info("startup: initializing cache DB schema")
-        await init_db()
-        log.info("startup: cache DB initialized")
-    except Exception:
-        log.exception("startup: init_db failed")
-
-# --- logging bootstrap (append-only) ---
-import logging, os, sys
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
-log = logging.getLogger("ari.main")
-log.info("logging configured")
-# --- end logging bootstrap ---
+app.include_router(admin_pkg)
 
 # v1 routers
 from app.api.v1 import brief as v1_brief
 from app.api.v1 import summary as v1_summary
 
-# admin sub-routers (each router should NOT include "/admin" in its own prefix)
-from app.api.admin import email as admin_email
-from app.api.admin import cache as admin_cache
-from app.api.admin import jobs as admin_jobs
-from app.api.admin import cache_diag
-
-# mount routers
+# mount v1 routers
 app.include_router(v1_brief.router)        # /api/v1/brief
 app.include_router(v1_summary.router)      # /api/v1/summarize (GET+POST)
-
-# mount admin subrouters under /admin
-app.include_router(admin_email.router, prefix="/admin")   # /admin/email/brief
-app.include_router(admin_cache.router, prefix="/admin")   # /admin/cache/...
-app.include_router(admin_jobs.router, prefix="/admin")    # /admin/jobs/...
-app.include_router(cache_diag.router)  # /admin/cache_diag
 
 # debug API
 from app.api import debug as debug_api
@@ -66,7 +40,7 @@ from app.api import debug as debug_api
 if not any(getattr(r, "path", "") == "/debug/healthz" for r in app.router.routes):
     app.include_router(debug_api.router, prefix="/debug")
 
-# database initialization
+# database initialization helpers (kept)
 import os
 import aiosqlite
 import logging
@@ -125,22 +99,13 @@ async def purge_expired(ttl_days: int = 7) -> int:
         log.error("purge_expired failed: %s", e)
     return deleted
 
-# admin jobs are mounted above; removed duplicate remount logic to avoid double-mounting
-# (previous try/except remount block deleted)
-
-# keep /debug router if present
+# keep /debug router if present (already included above)
 try:
     from app.api.debug import router as debug_router  # type: ignore
     if not any(getattr(r, "path", "").startswith("/debug") for r in app.router.routes):
         app.include_router(debug_router, prefix="/debug")
 except Exception:
     pass
-
-# include admin routers — do not re-add an "/admin" prefix here because routers already use it
-app.include_router(admin_cache.router)
-app.include_router(admin_jobs.router)
-app.include_router(admin_email.router)
-app.include_router(cache_diag.router)
 
 # make sure these are exported
 __all__ = [

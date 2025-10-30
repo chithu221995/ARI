@@ -3,6 +3,8 @@ import os
 import asyncio
 from typing import List, Dict
 
+from app.core.cache import cache_upsert_items
+
 async def fetch_news(ticker: str, *, use_mock: bool = False) -> List[Dict]:
     """
     Fetch latest news items for a ticker.

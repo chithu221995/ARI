@@ -3,636 +3,470 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
-from zoneinfo import ZoneInfo
+from typing import Optional, Dict, Any, List
 import time
 import json
-from typing import List, Dict, Any, Optional
-
 import aiosqlite
-import httpx
-import trafilatura
-import re
-# try to use existing detect_language helper if available
-try:
-    from app.core.lang import detect_language
-except Exception:
-    def detect_language(text: str) -> str:
-        # best-effort fallback: assume English
-        return "en"
+import hashlib
 
-from app.core.cache import (
-    CACHE_DB_PATH,
-    url_hash,
-    cache_upsert_items,
-    cache_upsert_summaries,
-    now_iso,
-    set_meta,
+from fastapi import APIRouter, Body, Query, Depends, HTTPException
+
+from app.core import settings
+from app.core.cache import cache_upsert_items, url_hash, CACHE_DB_PATH, ensure_summaries_schema
+from app.core.dates import now_iso as _now_iso
+from app.ingest.news import (
+    fetch_news_for_ticker,
+    extract_and_cache_bodies,
 )
+from app.ingest.extract import extract_text, extract_via_diffbot
 from app.summarize.llm import summarize_items
-from app.ingest.fusion import fetch_fused_news
-
-from fastapi import APIRouter
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 log = logging.getLogger("ari.jobs")
-# ensure router prefix/tag
-router = APIRouter(prefix="/jobs", tags=["admin"])
+router = APIRouter(prefix="/jobs", tags=["jobs"])
 
-_scheduler: Optional[AsyncIOScheduler] = None
-_started = False
-
-# track last run times (UTC)
-_last_prefetch_time: Optional[datetime] = None
-_last_summarize_time: Optional[datetime] = None
-
-# also keep ISO timestamps of last runs for external APIs / status
-LAST_PREFETCH_AT: Optional[str] = None
-LAST_SUMMARIZE_AT: Optional[str] = None
-
-# schedule config (env-driven)
-SCHEDULE_TICKERS = [t.strip().upper() for t in os.getenv("SCHEDULE_TICKERS", "").split(",") if t.strip()]
-CRON_PREFETCH = os.getenv("CRON_PREFETCH", "0 7 * * *")
-CRON_SUMMARIZE = os.getenv("CRON_SUMMARIZE", "30 7 * * *")
-CRON_PURGE = os.getenv("CRON_PURGE", "0 3 * * *")  # default 03:00 IST
+# try to import canonical dependency helper; fallback to a safe default
+try:
+    from app.api.admin.deps import get_tickers_dep  # type: ignore
+except Exception:
+    async def get_tickers_dep() -> List[str]:
+        return getattr(settings, "SCHEDULE_TICKERS", []) or []
 
 
-# ---- Job implementations ----
-async def job_prefetch(tickers: Optional[list[str]] = None):
-    global _last_prefetch_time, LAST_PREFETCH_AT
-    start_ts = time.time()
-    try:
-        tickers = tickers or SCHEDULE_TICKERS or []
-        log.info("[jobs] prefetch START tickers=%s", tickers)
-        processed = 0
-
-        for t in tickers:
-            items_for_ticker: list[dict] = []
-            try:
-                # fetch fused news for this ticker (uses configured sources & filters)
-                items_for_ticker = await fetch_fused_news(t)
-                processed += 1
-            except Exception:
-                log.exception("[jobs] prefetch: fetch_news_for_ticker failed for %s", t)
-                continue
-
-            # transform fetched items into article rows and upsert (best-effort)
-            try:
-                rows: List[Dict[str, Any]] = []
-                for n in (items_for_ticker or []):
-                    url = (n.get("url") or "").strip()
-                    rows.append(
-                        {
-                            "url_hash": url_hash(url),
-                            "url": url,
-                            "ticker": t,
-                            "source": n.get("source") or "",
-                            "title": n.get("title") or "",
-                            "published_at": n.get("published_at") or n.get("publishedAt") or "",
-                            "lang": (n.get("lang") or "en"),
-                            "content": n.get("content") or n.get("translated_text") or "",
-                            "text_hash": "",
-                            "created_at": None,
-                        }
-                    )
-                if rows:
-                    inserted = await cache_upsert_items(rows, ticker=t)
-                    log.info("[jobs] prefetch: upserted %d articles for %s", int(inserted or len(rows)), t)
-            except Exception:
-                log.exception("[jobs] failed to upsert collected items into cache for %s", t)
-                continue
-
-        _last_prefetch_time = datetime.now(timezone.utc)
-        elapsed_ms = int((time.time() - start_ts) * 1000)
-
-        # record last-run in meta and log counts
-        try:
-            now_iso_val = now_iso()
-            await set_meta("last_prefetch_at", now_iso_val)
-            arts = await count_articles_rows()
-            sums = await count_summaries_rows()
-            LAST_PREFETCH_AT = now_iso_val
-            log.info("[jobs] prefetch DONE at=%s processed=%d elapsed_ms=%d articles=%s summaries=%s", now_iso_val, processed, elapsed_ms, arts, sums)
-        except Exception:
-            log.exception("[jobs] post-prefetch bookkeeping failed")
-    except Exception:
-        log.exception("[jobs] prefetch FAILED")
-        raise
+# --- Helper: resolve tickers from payload or settings.SCHEDULE_TICKERS ---
+def _resolve_tickers(payload: Optional[Dict[str, Any]]) -> List[str]:
+    provided = (payload or {}).get("tickers")
+    if provided and isinstance(provided, list) and len(provided) > 0:
+        return [str(x).strip() for x in provided if str(x).strip()]
+    return getattr(settings, "SCHEDULE_TICKERS", []) or []
 
 
-async def job_summarize(tickers: Optional[list[str]] = None):
+# --- cache-only summarizer per-ticker (returns upsert count) ---
+async def job_summarize(tickers: Optional[List[str]] = None) -> int:
     """
-    Summarize recent articles per ticker and persist summaries.
-    - loads recent article candidates (last 72h) not already summarized
-    - fetches article body when missing
-    - calls summarize_items and upserts returned summaries
+    Summarize recent cached articles for the provided tickers and persist summaries.
+    Returns the number of summaries upserted (int) for the tickers handled.
     """
-    global _last_summarize_time, LAST_SUMMARIZE_AT
     start_ts = time.time()
+    tickers = tickers or getattr(settings, "SCHEDULE_TICKERS", []) or []
+    limit = int(getattr(settings, "SUMMARY_TOPK", 5) or 5)
+    # process each ticker and sum upserted counts
     total_upserted = 0
-    tickers = tickers or SCHEDULE_TICKERS or []
-    tickers_count = len(tickers)
-    try:
-        for ticker in tickers:
-            t = ticker
-            ts_now = datetime.now(timezone.utc)
-            cutoff = (ts_now - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            candidates: List[Dict[str, Any]] = []
-            # select articles for ticker that are not yet summarized (left join)
-            q = """
-            SELECT a.url, a.title, a.source, a.published_at, a.translated_text, a.lang, a.url_hash
-            FROM articles a
-            LEFT JOIN summaries s ON s.item_url_hash = a.url_hash
-            WHERE a.ticker = ? AND a.created_at >= ? AND a.lang = 'en' AND s.item_url_hash IS NULL
-            ORDER BY a.published_at DESC
-            LIMIT 100
-            """
+
+    for t in tickers:
+        candidates: List[Dict[str, Any]] = []
+        # select only rows that have content
+        q = f"""
+        SELECT url, url_hash, title, content
+        FROM articles
+        WHERE ticker = ?
+          AND content IS NOT NULL
+          AND LENGTH(content) > 0
+        ORDER BY created_at DESC
+        LIMIT ?
+        """
+        try:
+            log.debug("job_summarize: loading candidates ticker=%s limit=%d", t, limit)
+            async with aiosqlite.connect(CACHE_DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(q, (t, limit)) as cur:
+                    rows = await cur.fetchall()
+            log.debug("job_summarize: ticker=%s db_rows_fetched=%d", t, len(rows or []))
+        except Exception:
+            log.exception("job_summarize: DB candidate load failed for %s", t)
+            continue
+
+        for r in (rows or []):
             try:
-                async with aiosqlite.connect(CACHE_DB_PATH) as db:
-                    async with db.execute(q, (t, cutoff)) as cur:
-                        rows = await cur.fetchall()
-                        for url, title, source, published_at, translated_text, lang, url_h in rows:
-                            candidates.append(
-                                {
-                                    "url": url or "",
-                                    "title": title or "",
-                                    "source": source or "",
-                                    "published_at": published_at or "",
-                                    "translated_text": translated_text or "",
-                                    "lang": lang or "en",
-                                    "url_hash": url_h or "",
-                                }
-                            )
+                rv = dict(r)
             except Exception:
-                log.exception("[jobs] summarize: DB candidate load failed for %s", t)
+                rv = r
+            content = rv.get("content") or ""
+            if not content or len(content) < 500:
                 continue
+            # include url_hash in candidates so we can later enforce allowed set
+            candidates.append(
+                {
+                    "url": rv.get("url") or "",
+                    "url_hash": rv.get("url_hash") or "",
+                    "title": rv.get("title") or "",
+                    "source": rv.get("source") or "",
+                    "published_at": rv.get("created_at") or "",
+                    "translated_text": content,
+                    "lang": rv.get("lang") or "en",
+                }
+            )
 
-            # enrich with article text when missing and enforce minimum length
-            items_for_llm: List[Dict[str, Any]] = []
-            for c in candidates:
-                # ensure we have translated_text (try fetch if missing)
-                if not (c.get("translated_text") or "").strip():
-                    try:
-                        art = await fetch_article_text(c.get("url") or "")
-                        c["translated_text"] = (art.get("translated_text") or "").strip()
-                        c["lang"] = art.get("lang") or c.get("lang")
-                    except Exception:
-                        c["translated_text"] = c.get("translated_text") or ""
+        log.debug("job_summarize: ticker=%s candidates_after_filter=%d", t, len(candidates))
+        if not candidates:
+            log.info("job_summarize: %s no cached articles with sufficient content, skipping", t)
+            continue
 
-                # skip if still empty or too short to summarize
-                txt = (c.get("translated_text") or "").strip()
-                if not txt or len(txt) < 400:
-                    # too short or no text — skip
-                    continue
+        # build allowed set of url_hash values from the candidates we will send
+        allowed = { (c.get("url_hash") or "").strip() for c in candidates if c.get("url_hash") }
+        sent_count = len(candidates)
 
-                items_for_llm.append(
-                    {
-                        "title": c.get("title") or "",
-                        "url": c.get("url") or "",
-                        "translated_text": txt,
-                        "source": c.get("source") or "",
-                        "category": "NEWS",
-                        "published_at": c.get("published_at") or "",
-                        "summary_allowed": True,
-                    }
-                )
-
-            # log counts: total candidates loaded vs items we'll send to the LLM
-            log.info("[jobs] summarize: %s candidates=%d will_send=%d", t, len(candidates), len(items_for_llm))
-            if not items_for_llm:
-                log.info("[jobs] summarize: %s no items meeting length/availability criteria, skipping", t)
-                continue
-
-            # call LLM
-            try:
-                call_start = time.time()
-                llm_out = await summarize_items(items_for_llm, ticker=t)
-                latency_ms = int((time.time() - call_start) * 1000)
-                log.info("[jobs] summarize: LLM finished for %s latency_ms=%d ok=%s", t, latency_ms, bool(llm_out.get("ok", True)))
-            except Exception:
-                log.exception("[jobs] summarize: LLM call failed for %s", t)
-                continue
-
-            # prepare upsert rows; ensure we have at least one item (synthesize fallback if needed)
-            rows_to_upsert: List[Dict[str, Any]] = []
+        # call summarizer
+        try:
+            log.debug("job_summarize: ticker=%s sending %d candidates to LLM", t, len(candidates))
+            call_start = time.time()
+            llm_out = await summarize_items(candidates, ticker=t)
+            latency_ms = int((time.time() - call_start) * 1000)
+            ok = bool(llm_out.get("ok", True))
+            log.info(f"job_summarize: LLM finished for {t} latency_ms={llm_out.get('latency_ms')} ok={ok}")
+            # defensive: coerce to list and bail early if empty
             items = llm_out.get("items") or []
             if not items:
-                # synthesize a minimal summary from the first candidate's translated_text
-                try:
-                    src = items_for_llm[0]
-                    txt = (src.get("translated_text") or "").strip()
-                    excerpt = " ".join(txt.splitlines())[:800].strip()
-                    synth_title = (src.get("title") or "").strip() or (excerpt[:120] + "...")
-                    log.warning("[jobs] summarize: LLM returned 0 items for %s; synthesizing fallback summary", t)
-                    items = [
-                        {
-                            "url": src.get("url") or "",
-                            "title": synth_title,
-                            "bullets": [excerpt],
-                            "why_it_matters": "",
-                            "sentiment": "Neutral",
-                        }
-                    ]
-                except Exception:
-                    log.exception("[jobs] summarize: failed to synthesize fallback summary for %s", t)
-                    items = []
+                log.warning(f"job_summarize: empty LLM output for {t}, skipping DB upsert")
+                continue
+        except Exception:
+            log.exception("job_summarize: LLM call failed for %s", t)
+            continue
 
-            for it in items:
-                url = (it.get("url") or "").strip()
-                try:
-                    h = url_hash(url) if url else (it.get("item_url_hash") or "")
-                except Exception:
-                    h = it.get("item_url_hash") or ""
-                bullets = it.get("bullets") or []
-                if isinstance(bullets, list):
-                    bullets_text = "\n".join([str(b).strip() for b in bullets if b and str(b).strip()])
-                else:
-                    bullets_text = str(bullets or "")
-                rows_to_upsert.append(
-                    {
-                        "item_url_hash": h,
-                        "ticker": t,
-                        "title": it.get("title") or "",
-                        "url": url,
-                        "bullets": bullets_text,
-                        "why_it_matters": it.get("why_it_matters") or "",
-                        "sentiment": it.get("sentiment") or "Neutral",
-                        "created_at": now_iso(),
-                    }
-                )
+        items_raw = (llm_out.get("items") or [])[:limit]
+        log.debug("job_summarize: ticker=%s llm_returned=%d", t, len(items_raw))
+        # build mapping from candidate positions
+        pos_map: Dict[int, Dict[str, Any]] = {i: c for i, c in enumerate(candidates[:limit], start=1)}
 
-            # persist summaries
+        # normalize each returned item with fallbacks to candidate by position/article_number
+        items_parsed: List[Dict[str, Any]] = []
+        for idx, it in enumerate(items_raw):
+            # safe article_number extraction
+            art_no = None
             try:
-                upserted = await cache_upsert_summaries(rows_to_upsert)
-                total_upserted += int(upserted or 0)
-                log.info("[jobs] summarize: upserted %d summaries for %s", int(upserted or 0), t)
+                art_no = int(it.get("article_number")) if it.get("article_number") is not None else None
             except Exception:
-                log.exception("[jobs] summarize: upsert failed for %s", t)
+                art_no = None
+
+            fallback_cand = pos_map.get(art_no) or pos_map.get(idx + 1) or {}
+            url = (it.get("url") or fallback_cand.get("url") or fallback_cand.get("orig_url") or "").strip()
+            title_en = (it.get("title") or fallback_cand.get("title") or "").strip()
+            why = (it.get("summary") or it.get("why_it_matters") or "").strip()
+            sentiment = (it.get("sentiment") or "Neutral").strip()
+            sl = sentiment.lower()
+            if "neg" in sl or "negative" in sl:
+                sentiment = "Negative"
+            elif "pos" in sl or "positive" in sl:
+                sentiment = "Positive"
+            else:
+                sentiment = "Neutral"
+
+            rel_raw = it.get("relative_relevance") or it.get("relevance") or it.get("score") or it.get("rank")
+            rel_val = None
+            if rel_raw is not None:
+                try:
+                    rel_val = int(str(rel_raw).strip())
+                except Exception:
+                    rel_val = None
+
+            # heuristic default if model omitted/invalid score
+            if rel_val is None:
+                txt = f"{title_en} {why}".lower()
+                if any(k in txt for k in ["stock pick", "day trading", "outlook for the day", "pr wire", "listicle", "options"]):
+                    rel_val = 2
+                elif any(k in txt for k in ["layoff", "acquisition", "guidance", "fine", "lawsuit", "contract", "win", "upgrade", "margin", "regulation", "customer"]):
+                    rel_val = 8
+                else:
+                    rel_val = 4
+
+            art_no_final = art_no if isinstance(art_no, int) and 1 <= art_no <= 5 else (idx + 1)
+
+            # preserve any model-provided url_hash/item_url_hash if present
+            items_parsed.append({
+                 "article_number": art_no_final,
+                 "url": url,
+                 "url_hash": it.get("url_hash") or it.get("item_url_hash") or "",
+                 "title": title_en,
+                 "summary": why,
+                 "sentiment": sentiment,
+                 "relevance": int(rel_val),            # <— add canonical relevance
+                 "relative_relevance": int(rel_val),   # keep for backward-compat
+             })
+
+        log.debug("job_summarize: ticker=%s parsed_items=%d", t, len(items_parsed))
+
+        # filter / dedupe strictly using allowed url_hash set and derived hashes
+        seen = set()
+        filtered: List[Dict[str, Any]] = []
+        for it in items_parsed:
+            h = (it.get("item_url_hash") or it.get("url_hash") or "").strip()
+            if not h:
+                url = (it.get("url") or "").strip()
+                if url:
+                    try:
+                        h = url_hash(url)
+                    except Exception:
+                        h = ""
+            if not h or (allowed and h not in allowed) or h in seen:
+                continue
+            seen.add(h)
+            # ensure the retained item carries the canonical hash
+            it["item_url_hash"] = h
+            filtered.append(it)
+
+        # truncate to number of candidates sent
+        filtered = filtered[:len(candidates)]
+        parsed_count = len(items_parsed)
+        kept_count = len(filtered)
+        log.debug("job_summarize: ticker=%s sent=%d parsed=%d kept=%d", t, sent_count, parsed_count, kept_count)
+
+
+        # ensure summaries schema/index then idempotent upsert by URL-hash
+        try:
+            await ensure_summaries_schema(CACHE_DB_PATH)
+        except Exception:
+            log.exception("job_summarize: migration check failed; continuing to upsert")
+
+        insert_sql = """
+        INSERT INTO summaries
+        (ticker, item_url_hash, url, title, why_it_matters, bullets, sentiment, relevance, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_url_hash) DO UPDATE SET
+          title=excluded.title,
+          why_it_matters=excluded.why_it_matters,
+          bullets=excluded.bullets,
+          sentiment=excluded.sentiment,
+          relevance=excluded.relevance,
+          created_at=excluded.created_at
+        """
+        # Prefer filtered (hash-validated) items; if empty, fall back to the parsed list (not raw LLM output)
+        items = filtered if filtered else items_parsed
+        log.debug("job_summarize: ticker=%s preparing upsert for %d items (filtered=%d)", t, len(items), len(filtered))
+        if not items:
+            log.warning("job_summarize: no items to upsert for %s (filtered empty and parsed empty)", t)
+            continue
+
+        params = []
+        now = _now_iso()
+        for it in items:
+            url = (it.get("url") or "").strip()
+            if not url:
+                continue
+            try:
+                url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
+            except Exception:
+                log.exception("job_summarize: failed to hash url=%s", url)
                 continue
 
-        # bookkeeping
-        ts = now_iso()
-        try:
-            await set_meta("last_summarize_at", ts)
-            LAST_SUMMARIZE_AT = ts
-        except Exception:
-            log.exception("[jobs] summarize: failed to set meta last_summarize_at")
+            title = (it.get("title") or "").strip()
+            why = (it.get("why_it_matters") or it.get("summary") or "").strip()
+            bullets = it.get("bullets") if isinstance(it.get("bullets"), list) else []
+            sentiment = (it.get("sentiment") or "Neutral").strip()
 
-        elapsed_ms = int((time.time() - start_ts) * 1000)
-        log.info("[jobs] summarize DONE at=%s processed=%d upserted=%d elapsed_ms=%d", ts, tickers_count, total_upserted, elapsed_ms)
-    except Exception:
-        log.exception("[jobs] summarize FAILED")
-        raise
+            # Cast and clamp relevance from the normalized item (prefer canonical "relevance")
+            rel_field = it.get("relevance", None)
+            if rel_field is None:
+                rel_field = it.get("relative_relevance", None)
 
-
-async def job_purge():
-    """
-    Run TTL purge and record a row in ingest_runs with run_type='ttl_purge'
-    """
-    started_at = datetime.now(timezone.utc)
-    a = s = f = 0
-    try:
-        log.info("[jobs] purge START")
-        res = await purge_expired()
-        if isinstance(res, tuple) and len(res) == 3:
-            a, s, f = res
-        elif isinstance(res, int):
-            # old helper returned total deleted; map it to articles and leave others 0
-            a = res
-        finished_at = datetime.now(timezone.utc)
-        log.info("[jobs] purge DONE (articles=%s summaries=%s filings=%s)", a, s, f)
-    except Exception:
-        log.exception("[jobs] purge FAILED")
-        finished_at = datetime.now(timezone.utc)
-        a = s = f = 0
-
-    total = (a or 0) + (s or 0) + (f or 0)
-
-    # record run in ingest_runs (best-effort; ignore errors)
-    try:
-        db_path = os.getenv("SQLITE_PATH", "./ari.db")
-        async with aiosqlite.connect(db_path) as db:
-            await db.execute("PRAGMA journal_mode=WAL;")
-            await db.execute(
-                "INSERT INTO ingest_runs (run_type, started_at, finished_at, count, ok) VALUES (?, ?, ?, ?, ?)",
-                ("ttl_purge", started_at.isoformat(), finished_at.isoformat(), total, 1),
-            )
-            await db.commit()
-    except Exception:
-        log.exception("[jobs] failed to record ingest_runs for purge")
-
-
-def _get_crons() -> Dict[str, str]:
-    return {"prefetch": CRON_PREFETCH, "summarize": CRON_SUMMARIZE, "purge": CRON_PURGE}
-
-
-def _ensure_scheduler():
-    global _scheduler, _started
-    if _scheduler is None:
-        _scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
-    if _started:
-        return
-
-    crons = _get_crons()
-
-    # purge prior jobs
-    try:
-        for j in list(_scheduler.get_jobs()):
             try:
-                _scheduler.remove_job(j.id)
+                relevance = int(str(rel_field).strip())
             except Exception:
-                pass
-    except Exception:
-        pass
+                relevance = 4  # fallback default
 
-    try:
-        _scheduler.add_job(job_prefetch, CronTrigger.from_crontab(crons["prefetch"]), id="prefetch")
-        _scheduler.add_job(job_summarize, CronTrigger.from_crontab(crons["summarize"]), id="summarize")
-        # schedule TTL purge
-        _scheduler.add_job(job_purge, CronTrigger.from_crontab(crons["purge"], timezone=ZoneInfo("Asia/Kolkata")), id="ttl_purge")
-    except Exception as e:
-        log.exception("[jobs] failed to add cron jobs: %s", e)
+            relevance = max(1, min(10, relevance))
 
-    if not _scheduler.running:
-        _scheduler.start()
+            # Debug what will be written
+            log.debug("upsert summary: url=%s rel_raw=%r rel_int=%d sentiment=%s", url, rel_field, relevance, sentiment)
 
-    # log schedule + next runs
-    try:
-        j1 = _scheduler.get_job("prefetch")
-        j2 = _scheduler.get_job("summarize")
-        j3 = _scheduler.get_job("ttl_purge")
-        log.info("[jobs] started. CRON_PREFETCH='%s', next=%s", crons["prefetch"], getattr(j1, "next_run_time", None))
-        log.info("[jobs] started. CRON_SUMMARIZE='%s', next=%s", crons["summarize"], getattr(j2, "next_run_time", None))
-        log.info("[jobs] started. CRON_PURGE='%s', next=%s", crons["purge"], getattr(j3, "next_run_time", None))
-    except Exception:
-        log.exception("[jobs] failed to read scheduler jobs")
+            params.append((
+                t, url_hash, url, title, why, json.dumps(bullets),
+                sentiment, relevance, now
+            ))
 
-    _started = True
+        log.debug("job_summarize: ticker=%s upsert params prepared=%d", t, len(params))
+        if not params:
+            log.info("job_summarize: no valid params to upsert for %s", t)
+            continue
 
-
-@router.on_event("startup")
-async def _on_startup():
-    try:
-        _ensure_scheduler()
-    except Exception:
-        log.exception("[jobs] scheduler startup failed")
-
-
-@router.on_event("shutdown")
-async def _on_shutdown():
-    global _scheduler, _started
-    try:
-        if _scheduler and _scheduler.running:
-            _scheduler.shutdown(wait=False)
-    except Exception:
-        log.exception("[jobs] scheduler shutdown error")
-    _started = False
-    _scheduler = None
-
-
-@router.get("/ping")
-async def jobs_ping():
-    return {"ok": True, "component": "jobs"}
-
-
-@router.get(
-    "/state",
-    summary="Show scheduler state",
-    description="Return scheduler cron configuration, next-run times and last-run timestamps for prefetch/summarize/purge.",
-)
-async def job_state():
-    crons = _get_crons()
-    info: Dict[str, Any] = {"running": bool(_scheduler and _scheduler.running), "crons": crons}
-    if _scheduler:
         try:
-            for j in _scheduler.get_jobs():
-                info[j.id] = {"next_run_time": getattr(j, "next_run_time", None)}
+            async with aiosqlite.connect(CACHE_DB_PATH) as db:
+                await db.executemany(insert_sql, params)
+                await db.commit()
+            upserted_i = len(params)
+            total_upserted += upserted_i
+            log.info("job_summarize: %s upserted %d summaries", t, upserted_i)
         except Exception:
-            log.exception("[jobs] failed to read scheduler jobs")
-    return info
+            log.exception("job_summarize: DB upsert failed for %s", t)
+            continue
+
+    elapsed = time.time() - start_ts
+    log.info("job_summarize: finished tickers=%s total_upserted=%d elapsed=%.3f secs", tickers, total_upserted, elapsed)
+    return int(total_upserted)
 
 
-@router.get("/debug/status")
-async def debug_status():
+# --- HTTP endpoints -------------------------------------------------------
+@router.post("/run/fetch")
+async def run_fetch(payload: Optional[Dict[str, Any]] = Body(None)):
     """
-    Returns scheduler + last-run + basic counts.
-    last_prefetch, last_summarize: ISO timestamps or None
-    articles_rows, summaries_rows: integers (0 on error)
-    scheduled: mapping job_id -> next_run_time ISO or None
+    Fetch endpoint: fetch up to NEWS_TOPK per ticker and persist returned candidate rows.
+    Returns per-ticker counts of fetched and upserted rows.
     """
-    # fetch counts using the cache helpers
-    try:
-        articles = await count_articles_rows()
-        summaries = await count_summaries_rows()
-    except Exception:
-        log.exception("[jobs] debug.status: count helpers failed")
-        articles = 0
-        summaries = 0
+    tickers = _resolve_tickers(payload)
+    results: Dict[str, Any] = {}
+    fetched_total = 0
+    upserted_total = 0
 
-    # scheduled next run times
-    scheduled: Dict[str, Optional[str]] = {}
-    if _scheduler:
+    # request up to NEWS_TOPK items per ticker
+    news_topk = int(getattr(settings, "NEWS_TOPK", 10) or 10)
+    for t in tickers:
         try:
-            for j in _scheduler.get_jobs():
-                nrt = getattr(j, "next_run_time", None)
-                scheduled[j.id] = nrt.isoformat() if nrt else None
-        except Exception:
-            log.exception("[jobs] debug.status: failed to enumerate scheduled jobs")
+            rows = await fetch_news_for_ticker(
+                t,
+                max_items=news_topk,
+                days=int(getattr(settings, "NEWS_DAYS", 7) or 7),
+            )
+            got = len(rows or [])
+            # persist all returned candidate metadata (content may be empty)
+            upserted_i = int(await cache_upsert_items(rows or []))
+
+            fetched_total += got
+            upserted_total += int(upserted_i)
+            results[t] = {"got": got, "upserted": int(upserted_i)}
+            log.info(
+                "run/fetch: ticker=%s requested=%d returned=%d upserted=%d",
+                t,
+                news_topk,
+                got,
+                int(upserted_i),
+            )
+
+            # quick validation count of recent rows (guarded, remove later)
+            try:
+                db_path = getattr(settings, "CACHE_DB_PATH", "./ari.db")
+                async with aiosqlite.connect(db_path) as db:
+                    async with db.execute("SELECT COUNT(*) FROM articles WHERE created_at > datetime('now','-10 minutes')") as cur:
+                        row = await cur.fetchone()
+                        recent_cnt = int(row[0]) if row and row[0] is not None else 0
+                log.info("run/fetch: post-upsert recent rows=%d", recent_cnt)
+            except Exception:
+                log.exception("run/fetch: post-upsert count failed for %s", t)
+        except Exception as e:
+            log.exception("run/fetch failed for %s", t)
+            results[t] = {"got": 0, "upserted": 0, "error": type(e).__name__}
 
     return {
         "ok": True,
-        "last_prefetch": _last_prefetch_time.isoformat() if _last_prefetch_time else None,
-        "last_summarize": _last_summarize_time.isoformat() if _last_summarize_time else None,
-        "articles_rows": int(articles or 0),
-        "summaries_rows": int(summaries or 0),
-        "scheduled": scheduled,
+        "fetched": fetched_total,
+        "upserted": upserted_total,
+        "tickers": tickers,
+        "results": results,
     }
 
 
-@router.post(
-    "/run/prefetch",
-    summary="Run prefetch now",
-    description=(
-        "Fetches the latest English news for configured tickers (7-day window) and writes "
-        "articles into the local cache. Use to prime today's data immediately."
-    ),
-)
-async def run_prefetch():
-    await job_prefetch()
-    return {"ok": True, "ran": "prefetch", "at": datetime.now(timezone.utc).isoformat()}
-
-
-@router.post(
-    "/run/summarize",
-    summary="Run summarize now",
-    description=(
-        "Summarize recent cached articles for configured tickers using the LLM and persist "
-        "summary rows into the cache. Useful to regenerate summaries on demand."
-    ),
-)
-async def run_summarize():
-    await job_summarize()
-    return {"ok": True, "ran": "summarize", "at": datetime.now(timezone.utc).isoformat()}
-
-
-@router.post(
-    "/run/purge",
-    summary="Purge old cache rows",
-    description="Delete cached articles and summaries older than the configured retention (default: 7 days).",
-)
-async def run_purge():
-    await job_purge()
-    return {"ok": True, "ran": "purge", "at": datetime.now(timezone.utc).isoformat()}
-
-
-import os
-import logging
-import aiosqlite
-log = logging.getLogger("ari.cache")
-
-async def _db_path() -> str:
-    return os.getenv("SQLITE_PATH", "./ari.db")
-
-async def _table_exists(db: aiosqlite.Connection, name: str) -> bool:
-    cur = await db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,)
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    return bool(row)
-
-async def count_articles_rows() -> int:
-    try:
-        async with aiosqlite.connect(await _db_path()) as db:
-            if not await _table_exists(db, "articles"):
-                return 0
-            cur = await db.execute("SELECT COUNT(*) FROM articles")
-            (n,) = await cur.fetchone()
-            await cur.close()
-            return int(n or 0)
-    except Exception as e:
-        log.error("count_articles_rows failed: %s", e)
-        return 0
-
-async def count_summaries_rows() -> int:
-    try:
-        async with aiosqlite.connect(await _db_path()) as db:
-            if not await _table_exists(db, "summaries"):
-                return 0
-            cur = await db.execute("SELECT COUNT(*) FROM summaries")
-            (n,) = await cur.fetchone()
-            await cur.close()
-            return int(n or 0)
-    except Exception as e:
-        log.error("count_summaries_rows failed: %s", e)
-        return 0
-
-async def purge_expired(ttl_days: int = 7):
+@router.post("/run/extract")
+async def run_extract(payload: Optional[Dict[str, Any]] = Body(None)):
     """
-    Delete cache rows older than ttl_days. Return a triple (articles_deleted, summaries_deleted, filings_deleted).
-    If a table doesn't exist, count is 0. If 'filings' table was removed from prototype, return 0 for it.
+    Diffbot-only extraction:
+    - Select up to 10 most recent stubs (content NULL/empty) within fresh window.
+    - Try the first N = min(EXTRACT_MAX_TRIES, len(cands)) sequentially until we get EXTRACT_TARGET successes.
+    - No HTML fallback. Only Diffbot.
     """
-    a = s = f = 0
-    try:
-        async with aiosqlite.connect(await _db_path()) as db:
-            # articles
-            if await _table_exists(db, "articles"):
-                cur = await db.execute(
-                    "DELETE FROM articles WHERE created_at < datetime('now', ?)",
-                    (f"-{ttl_days} days",),
-                )
-                a = cur.rowcount or 0
-            # summaries
-            if await _table_exists(db, "summaries"):
-                cur = await db.execute(
-                    "DELETE FROM summaries WHERE created_at < datetime('now', ?)",
-                    (f"-{ttl_days} days",),
-                )
-                s = cur.rowcount or 0
-            # filings (optional / may not exist)
-            if await _table_exists(db, "filings"):
-                cur = await db.execute(
-                    "DELETE FROM filings WHERE created_at < datetime('now', ?)",
-                    (f"-{ttl_days} days",),
-                )
-                f = cur.rowcount or 0
+    tickers = _resolve_tickers(payload)
+    hours = int(getattr(settings, "FRESH_WINDOW_HOURS", 24) or 24)
+    target = int(getattr(settings, "EXTRACT_TARGET", 5) or 5)
+    max_tries = int(getattr(settings, "EXTRACT_MAX_TRIES", 7) or 7)
+    window_expr = f"datetime('now', '-{hours} hours')"
 
-            await db.commit()
-    except Exception as e:
-        log.error("purge_expired failed: %s", e)
-    return a, s, f
+    results: Dict[str, Any] = {}
+    db_path = getattr(settings, "CACHE_DB_PATH", "./ari.db")
 
-async def fetch_article_text(url: str) -> dict:
-    """
-    Minimal text fetcher for summarize job.
-    Returns {"translated_text": <string>, "lang": "en", "chars": <int>}.
-    - Uses httpx AsyncClient with UA
-    - Streams up to 1.5MB, extracts main text with trafilatura, fallback to stripping tags
-    - Detects language via detect_language(); non-'en' yields empty translated_text
-    """
-    if not url:
-        return {"translated_text": "", "lang": "en", "chars": 0}
-    try:
-        headers = {"User-Agent": "ARI-NewsFetcher/1.0"}
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return {"translated_text": "", "lang": "en", "chars": 0}
-            ctype = r.headers.get("content-type", "") or ""
-            if "text/html" not in ctype.lower():
-                return {"translated_text": "", "lang": "en", "chars": 0}
+    for t in tickers:
+        # 1) load up to 10 stubs
+        q = f"""
+        SELECT url, url_hash, title
+        FROM articles
+        WHERE ticker = ?
+          AND (content IS NULL OR LENGTH(content)=0)
+          AND created_at > {window_expr}
+        ORDER BY created_at DESC
+        LIMIT 10
+        """
+        try:
+            async with aiosqlite.connect(db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(q, (t,)) as cur:
+                    rows = await cur.fetchall()
+        except Exception:
+            log.exception("extract: DB load failed for %s", t)
+            results[t] = {"tried": 0, "updated": 0, "error": "db_load_failed"}
+            continue
 
-            limit = 1_500_000  # 1.5 MB
-            chunks = []
-            size = 0
-            async for chunk in r.aiter_bytes():
-                if not chunk:
-                    break
-                need = limit - size
-                if need <= 0:
-                    break
-                if len(chunk) > need:
-                    chunks.append(chunk[:need])
-                    size += need
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-            raw = b"".join(chunks)
+        if not rows:
+            results[t] = {"tried": 0, "updated": 0}
+            continue
+
+        tried = 0
+        updated = 0
+        # Limit attempts to first `max_tries` records
+        for r in (rows or [])[:max_tries]:
+            if updated >= target:
+                break
+            url = (r.get("url") or "").strip() if isinstance(r, dict) else (r["url"] or "").strip()
+            if not url:
+                continue
+            tried += 1
             try:
-                html = raw.decode("utf-8", errors="replace")
+                # Diffbot only, no fallback
+                text, src = await extract_text(url, provider="diffbot", allow_fallback=False)
             except Exception:
-                html = raw.decode("latin1", errors="replace")
+                log.exception("extract: diffbot call failed url=%s", url)
+                continue
 
-        # try trafilatura extraction
+            if not text or len(text) < 500:
+                # treat as failure, move to next candidate
+                log.debug("extract: insufficient content for url=%s len=%d", url, len(text or ""))
+                continue
+
+            # BEFORE building SQL params, define content/title safely
+            # r is a sqlite3.Row (mapping-like) — access by keys to avoid .get() on Row
+            row_keys = list(r.keys()) if hasattr(r, "keys") else []
+            if "text" in row_keys:
+                content_raw = r["text"] or ""
+            elif "content" in row_keys:
+                content_raw = r["content"] or ""
+            else:
+                content_raw = text or ""
+            content = (content_raw or "").strip()
+            title = r["title"] if "title" in row_keys else ""
+            if not content:
+                log.warning("extract: empty content from diffbot; skipping url=%s", url)
+                continue
+
+            # upsert body into articles
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    await db.execute(
+                        """
+                        UPDATE articles
+                           SET content = ?, lang = COALESCE(lang,'en'), title = COALESCE(title, ?)
+                         WHERE url = ?
+                        """,
+                        (content[:15000], title, url),
+                    )
+                    await db.commit()
+                log.info("extract: updated %s (len=%d)", url, len(content))
+                updated += 1
+            except Exception:
+                log.exception("extract: DB update failed url=%s", url)
+                continue
+
+        results[t] = {"tried": tried, "updated": updated}
+        log.info("run/extract: ticker=%s tried=%d updated=%d", t, tried, updated)
+
+    return {"ok": True, "results": results}
+
+
+@router.post("/run/summarize")
+async def run_summarize(payload: Optional[Dict[str, Any]] = Body(None)):
+    """
+    Trigger summarization job. Uses job_summarize() defined above.
+    """
+    tickers = _resolve_tickers(payload)
+    summarized: Dict[str, int] = {}
+    for t in tickers:
         try:
-            text = trafilatura.extract(html, include_comments=False, include_tables=False, include_formatting=False) or ""
+            n = await job_summarize([t])
+            summarized[t] = int(n or 0)
         except Exception:
-            text = ""
-
-        if not text:
-            # fallback crude tag-stripping
-            text = re.sub(r"<[^>]+>", " ", html)
-            text = " ".join(text.split())
-
-        chars = len(text or "")
-        try:
-            lang = detect_language(text or "")
-        except Exception:
-            lang = "en"
-
-        if (lang or "").lower() != "en":
-            return {"translated_text": "", "lang": lang, "chars": chars}
-
-        return {"translated_text": (text or "")[:15000], "lang": "en", "chars": chars}
-    except Exception:
-        return {"translated_text": "", "lang": "en", "chars": 0}
-
-
-# ensure symbols export
-__all__ = [
-    "count_articles_rows",
-    "count_summaries_rows",
-    "purge_expired",
-    "fetch_article_text",
-]
+            log.exception("run_summarize: failed for %s", t)
+            summarized[t] = 0
+    return {"ok": True, "summarized": summarized}

@@ -8,9 +8,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from app.scheduler.runner import run_daily_prefetch, run_daily_summarize
 from app.core.retry import with_backoff, RETRY_ATTEMPTS
+from app.api.admin import jobs, email
 
 router = APIRouter()
-
+admin = APIRouter(prefix="/admin", tags=["admin"])
+admin.include_router(jobs.router)   # yields /admin/jobs/...
+admin.include_router(email.router)  # yields /admin/email/...
 
 @router.get("/debug/scheduler")
 async def debug_scheduler(request: Request) -> Dict[str, Any]:

@@ -1,13 +1,15 @@
 from __future__ import annotations
+from typing import List, Dict, Any
+
+from app.core import settings
+
 import os
 import aiosqlite
-import datetime
-import hashlib
+from datetime import datetime, timezone, timedelta
 import logging
-import json
-from typing import List, Dict, Optional, Any, Tuple
+import hashlib
 
-log = logging.getLogger("ari.cache")
+log = logging.getLogger("ari.news")
 
 # how many days to keep cache rows
 CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "7"))
@@ -26,19 +28,19 @@ async def open_db():
 
 async def init_db():
     async with aiosqlite.connect(CACHE_DB_PATH) as db:
-        # existing create table statements for articles
+        # ensure tables
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS articles (
-                url TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT,
                 url_hash TEXT,
                 title TEXT,
-                ticker TEXT,
                 source TEXT,
                 published_at TEXT,
                 lang TEXT,
                 content TEXT,
-                created_at TEXT
+                created_at INTEGER
             )
             """
         )
@@ -92,8 +94,10 @@ async def init_db():
         # ensure helpful indexes exist
         try:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_articles_ticker_created ON articles(ticker, created_at)")
-            await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_urlhash ON articles(url_hash)")
-            log.info("cache.init_db: ensured indexes idx_articles_ticker_created and idx_articles_urlhash")
+            # ensure a UNIQUE index on url_hash so ON CONFLICT(url_hash) DO UPDATE works reliably
+            await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_url_hash ON articles(url_hash)")
+            # informational log so we can see the migration/ensure step
+            log.info("cache.init_db: ensured unique idx_articles_url_hash")
         except Exception:
             log.debug("cache.init_db: index creation failed (ignored)", exc_info=False)
 
@@ -120,69 +124,136 @@ def url_to_hash(url: str) -> str:
     return sha256_16((url or "").strip())
 
 
-# New helpers for upserting and reading cached items (news/articles and filings)
-async def cache_upsert_items(rows: List[Dict[str, Any]], ticker: Optional[str] = None) -> int:
+async def ensure_articles_schema(db_path: str) -> None:
     """
-    Upsert article rows into articles table.
+    Idempotent: ensure articles table and indexes exist.
+    """
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS articles (
+      id INTEGER PRIMARY KEY,
+      ticker TEXT,
+      title TEXT,
+      url TEXT,
+      url_hash TEXT UNIQUE,
+      source TEXT,
+      published_at TEXT,
+      lang TEXT,
+      content TEXT,
+      created_at TEXT
+    );
+    """
+    create_idx_hash = "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_url_hash ON articles(url_hash);"
+    create_idx_ticker = "CREATE INDEX IF NOT EXISTS idx_articles_ticker_created ON articles(ticker, created_at);"
+
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(create_table_sql)
+            await db.execute(create_idx_hash)
+            await db.execute(create_idx_ticker)
+            await db.commit()
+            log.debug("ensure_articles_schema: ensured articles schema at %s", db_path)
+    except Exception:
+        log.exception("ensure_articles_schema: failed for %s", db_path)
+
+
+async def ensure_summaries_schema(db_path: str) -> None:
+    """
+    Idempotent: ensure summaries table and indexes exist.
+    """
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS summaries (
+      id INTEGER PRIMARY KEY,
+      item_url_hash TEXT UNIQUE,
+      ticker TEXT,
+      title TEXT,
+      why_it_matters TEXT,
+      bullets TEXT,
+      sentiment TEXT,
+      relevance INTEGER,
+      created_at TEXT,
+      url TEXT
+    );
+    """
+    create_idx_hash = "CREATE UNIQUE INDEX IF NOT EXISTS idx_summaries_item_url_hash ON summaries(item_url_hash);"
+    create_idx_ticker = "CREATE INDEX IF NOT EXISTS idx_summaries_ticker_created ON summaries(ticker, created_at);"
+
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(create_table_sql)
+            # ensure unique index on item_url_hash (idempotent)
+            await db.execute(create_idx_hash)
+            await db.execute(create_idx_ticker)
+            await db.commit()
+            log.debug("ensure_summaries_schema: ensured summaries schema at %s", db_path)
+    except Exception:
+        log.exception("ensure_summaries_schema: failed for %s", db_path)
+
+
+# New helpers for upserting and reading cached items (news/articles and filings)
+async def cache_upsert_items(rows: list[dict]) -> int:
+    """
+    Upsert article stub rows into the articles table.
+    Expects each row to contain keys:
+      ticker, title, url, url_hash, source, published_at, lang, content, created_at
+    Returns number of DB changes (int).
     """
     if not rows:
         return 0
-    async with aiosqlite.connect(CACHE_DB_PATH) as db:
-        async with db.execute("BEGIN"):
-            stmt = """
-            INSERT INTO articles
-                (url, url_hash, title, ticker, source, published_at, lang, content, text_hash, created_at, translated_text)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET
-                 url_hash=excluded.url_hash,
-                 title=excluded.title,
-                 ticker=excluded.ticker,
-                 source=excluded.source,
-                 published_at=excluded.published_at,
-                 lang=excluded.lang,
-                 content=excluded.content,
-                 text_hash=excluded.text_hash,
-                 created_at=excluded.created_at,
-                 translated_text=excluded.translated_text
-            """
-            cnt = 0
-            log.debug("[cache] upserting %d article rows for ticker=%s", len(rows), ticker)
-            for r in rows:
-                vals = (
-                    r.get("url"),
-                    r.get("url_hash"),
-                    r.get("title", "") or "",
-                    r.get("ticker", "") or ticker or "",
-                    r.get("source", "") or "",
-                    r.get("published_at", "") or "",
-                    r.get("lang", "en") or "en",
-                    r.get("content", "") or "",
-                    r.get("text_hash", "") or "",
-                    r.get("created_at") or now_iso(),
-                    r.get("translated_text", "") or "",
-                )
-                try:
-                    await db.execute(stmt, vals)
-                    cnt += 1
-                except Exception as e:
-                    log.error("[cache] upsert articles failed: %s", e, exc_info=True)
-                    # fallback: INSERT OR REPLACE when conflict-target mismatch or other issues
-                    if "ON CONFLICT" in str(e) or "conflict" in str(e).lower():
-                        fallback_stmt = """
-                          INSERT OR REPLACE INTO articles
-                            (url, url_hash, title, ticker, source, published_at, lang, content, text_hash, created_at, translated_text)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """
-                        try:
-                            await db.execute(fallback_stmt, vals)
-                            cnt += 1
-                        except Exception as fe:
-                            log.error("[cache] fallback REPLACE failed: %s", fe, exc_info=True)
-                            raise
-                    else:
-                        raise
-        await db.commit()
-    return cnt
+
+    db_path = getattr(settings, "CACHE_DB_PATH", "./ari.db")
+    insert_sql = """
+    INSERT INTO articles
+      (ticker, title, url, url_hash, source, published_at, lang, content, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(url_hash) DO UPDATE SET
+      ticker = excluded.ticker,
+      title = excluded.title,
+      url = excluded.url,
+      source = excluded.source,
+      published_at = excluded.published_at,
+      lang = COALESCE(excluded.lang, articles.lang),
+      content = COALESCE(articles.content, excluded.content),
+      created_at = articles.created_at
+    ;
+    """
+
+    params = []
+    for r in rows:
+        params.append(
+            (
+                r.get("ticker"),
+                r.get("title"),
+                r.get("url"),
+                r.get("url_hash"),
+                r.get("source"),
+                r.get("published_at"),
+                r.get("lang"),
+                r.get("content"),
+                r.get("created_at"),
+            )
+        )
+
+    try:
+        # ensure schema exists (idempotent) before opening the connection used for the measured upsert
+        await ensure_articles_schema(db_path)
+
+        # perform upserts using a single connection and measure total_changes before/after
+        async with aiosqlite.connect(db_path) as db:
+            # ensure we have a fresh connection whose total_changes we can measure
+            db.row_factory = aiosqlite.Row
+            before = getattr(db, "total_changes", 0)
+
+            await db.executemany(insert_sql, params)
+            await db.commit()
+
+            after = getattr(db, "total_changes", 0)
+            changes = max(0, int(after - before))
+
+        log.info("cache_upsert_items: rows_in=%d changes=%d db=%s", len(params), changes, db_path)
+        return changes
+    except Exception:
+        log.exception("cache_upsert_items: upsert failed")
+        return 0
 
 
 async def cache_get_by_ticker(ticker: str, *, max_age_hours: int = 24) -> Dict[str, Any]:
@@ -220,59 +291,66 @@ async def cache_get_by_ticker(ticker: str, *, max_age_hours: int = 24) -> Dict[s
     return out
 
 
-async def cache_upsert_summaries(rows: List[Dict[str, Any]]) -> int:
+async def cache_upsert_summaries(rows: list[dict]) -> int:
     """
-    Upsert summary rows using INSERT OR REPLACE.
-    Accepts rows with keys: item_url_hash (optional), url (optional), ticker, title, bullets or bullets_json, why_it_matters, sentiment
+    Upsert summary rows into the summaries table.
+    Expects each row to contain keys:
+      item_url_hash, ticker, title, why_it_matters, sentiment, relevance, created_at, url
+    Returns number of rows actually inserted/updated (computed from sqlite total_changes).
     """
     if not rows:
         return 0
 
-    stmt = """
-    INSERT OR REPLACE INTO summaries
-      (item_url_hash, ticker, title, url, bullets, why_it_matters, sentiment, created_at)
+    db_path = getattr(settings, "CACHE_DB_PATH", "./ari.db")
+    insert_sql = """
+    INSERT INTO summaries
+      (item_url_hash, ticker, title, why_it_matters, sentiment, relevance, created_at, url)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(item_url_hash) DO UPDATE SET
+      ticker = excluded.ticker,
+      title = excluded.title,
+      why_it_matters = excluded.why_it_matters,
+      sentiment = excluded.sentiment,
+      relevance = excluded.relevance,
+      created_at = excluded.created_at,
+      url = excluded.url
+    ;
     """
 
-    upserted = 0
-    log.debug("[cache] upserting %d summaries", len(rows))
+    params = []
+    for r in rows:
+        # bind provided relevance if numeric; otherwise default to 5
+        rel = r.get("relevance")
+        try:
+            rel_val = int(str(rel).strip()) if rel is not None else 5
+        except Exception:
+            rel_val = 5
 
-    async with aiosqlite.connect(CACHE_DB_PATH) as db:
-        async with db.execute("BEGIN"):
-            for r in rows:
-                url = (r.get("url") or "").strip()
-                item_hash = r.get("item_url_hash") or url_hash(url)
-                bullets_val = r.get("bullets") if "bullets" in r else r.get("bullets_json", "[]")
-                try:
-                    if isinstance(bullets_val, list):
-                        bullets_str = json.dumps(bullets_val)
-                    else:
-                        bullets_str = bullets_val or "[]"
-                except Exception:
-                    bullets_str = "[]"
+        params.append(
+            (
+                r.get("item_url_hash"),
+                r.get("ticker"),
+                r.get("title"),
+                r.get("why_it_matters"),
+                r.get("sentiment"),
+                rel_val,
+                r.get("created_at"),
+                r.get("url"),
+            )
+        )
 
-                vals = (
-                    item_hash,
-                    r.get("ticker") or "",
-                    r.get("title") or "",
-                    url,
-                    bullets_str,
-                    r.get("why_it_matters") or "",
-                    r.get("sentiment") or "Neutral",
-                    r.get("created_at") or now_iso(),
-                )
-
-                try:
-                    await db.execute(stmt, vals)
-                    upserted += 1
-                except Exception as e:
-                    log.error("[cache] upsert summary failed for url/hash=%s/%s: %s", url or "", item_hash, e, exc_info=True)
-                    # continue with next row (do not abort the batch)
-                    continue
-        await db.commit()
-
-    log.info("[cache] upserted %d summaries", upserted)
-    return upserted
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            # measure total_changes before/after to compute actual writes
+            before = getattr(db, "total_changes", 0)
+            await db.executemany(insert_sql, params)
+            await db.commit()
+            after = getattr(db, "total_changes", 0)
+            upserted = max(0, int(after) - int(before))
+        return upserted
+    except Exception:
+        log.exception("cache_upsert_summaries: upsert failed")
+        return 0
 
 
 async def cache_get_summaries_map(conn: aiosqlite.Connection, url_hashes: List[str]) -> Dict[str, Dict]:
@@ -534,3 +612,130 @@ __all__ = [
     "set_meta",
     "get_meta",
 ]
+
+
+async def _fresh_cutoff_hours() -> int:
+    """
+    Return configured freshness window in hours (int).
+    """
+    return int(getattr(settings, "FRESH_WINDOW_HOURS", 24) or 24)
+
+
+async def has_fresh_urls(db, ticker: str) -> bool:
+    """
+    Return True if there are articles for ticker newer than the freshness window.
+    """
+    hours = await _fresh_cutoff_hours()
+    q = "SELECT COUNT(*) FROM articles WHERE ticker=? AND created_at > datetime('now', ?)"
+    async with db.execute(q, (ticker, f'-{hours} hours')) as cur:
+        row = await cur.fetchone()
+    return (row[0] or 0) > 0
+
+
+async def has_fresh_content(db, ticker: str) -> bool:
+    """
+    Return True if there are articles with non-empty content for ticker newer than the freshness window.
+    """
+    hours = await _fresh_cutoff_hours()
+    q = (
+        "SELECT COUNT(*) FROM articles "
+        "WHERE ticker=? AND created_at > datetime('now', ?) AND content IS NOT NULL AND LENGTH(content) > 0"
+    )
+    async with db.execute(q, (ticker, f'-{hours} hours')) as cur:
+        row = await cur.fetchone()
+    return (row[0] or 0) > 0
+
+
+async def has_fresh_summaries(db, ticker: str) -> bool:
+    """
+    Return True if there are summaries for ticker newer than the freshness window.
+    """
+    hours = await _fresh_cutoff_hours()
+    q = "SELECT COUNT(*) FROM summaries WHERE ticker=? AND created_at > datetime('now', ?)"
+    async with db.execute(q, (ticker, f'-{hours} hours')) as cur:
+        row = await cur.fetchone()
+    return (row[0] or 0) > 0
+
+
+async def ensure_llm_usage_schema(db_path: str) -> None:
+    sql_table = """
+    CREATE TABLE IF NOT EXISTS llm_usage (
+      date TEXT,
+      provider TEXT,
+      requests INTEGER DEFAULT 0,
+      last_minute_count INTEGER DEFAULT 0,
+      last_minute_ts INTEGER DEFAULT 0,
+      PRIMARY KEY (date, provider)
+    );
+    """
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(sql_table)
+            await db.commit()
+            log.debug("ensure_llm_usage_schema: ok db=%s", db_path)
+    except Exception:
+        log.exception("ensure_llm_usage_schema: failed for %s", db_path)
+
+
+def _today_ist_str() -> str:
+    # IST (UTC+5:30) date key
+    ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    return ist.date().isoformat()
+
+
+async def llm_allow_request(db_path: str, provider: str, rpm_cap: int, daily_cap: int) -> tuple[bool, int, bool]:
+    """
+    Enforce a simple RPM token limit and daily cap for provider.
+    Returns (allowed:bool, wait_ms:int, daily_cap_reached:bool)
+    - wait_ms: ms client should wait before retry (0 if allowed)
+    - daily_cap_reached: True when daily cap reached (requests >= daily_cap)
+    """
+    await ensure_llm_usage_schema(db_path)
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    today = _today_ist_str()
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = None
+        # ensure row exists
+        await db.execute(
+            "INSERT OR IGNORE INTO llm_usage(date, provider, requests, last_minute_count, last_minute_ts) VALUES (?, ?, 0, 0, ?)",
+            (today, provider, 0),
+        )
+        await db.commit()
+
+        # load current
+        async with db.execute("SELECT requests, last_minute_count, last_minute_ts FROM llm_usage WHERE date = ? AND provider = ?", (today, provider)) as cur:
+            row = await cur.fetchone()
+            if row:
+                requests, last_minute_count, last_minute_ts = int(row[0]), int(row[1]), int(row[2])
+            else:
+                requests, last_minute_count, last_minute_ts = 0, 0, 0
+
+        # daily cap check
+        if daily_cap is not None and daily_cap > 0 and requests >= daily_cap:
+            return False, 0, True
+
+        # rpm check using last_minute_ts window
+        window_ms = 60_000
+        elapsed = now_ms - last_minute_ts if last_minute_ts else window_ms + 1
+        if elapsed >= window_ms:
+            # reset minute bucket
+            current_minute_count = 1
+            new_last_minute_ts = now_ms
+        else:
+            current_minute_count = last_minute_count + 1
+            new_last_minute_ts = last_minute_ts
+
+        if rpm_cap is not None and rpm_cap > 0 and current_minute_count > rpm_cap:
+            # compute wait until minute window expires
+            wait_ms = max(0, window_ms - elapsed)
+            return False, wait_ms, False
+
+        # permitted: update counters
+        await db.execute(
+            "UPDATE llm_usage SET requests = requests + 1, last_minute_count = ?, last_minute_ts = ? WHERE date = ? AND provider = ?",
+            (current_minute_count, new_last_minute_ts, today, provider),
+        )
+        await db.commit()
+    return True, 0, False
