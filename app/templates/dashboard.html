@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}ARI - Dashboard{% endblock %}
+
+{% block header %}Manage Your Tickers{% endblock %}
+
+{% block content %}
+<article>
+    <form method="post" action="/dashboard">
+        <label for="email">
+            Email Address
+            <input 
+                type="email" 
+                id="email" 
+                name="email" 
+                value="{{ email or '' }}" 
+                placeholder="your@email.com"
+                required
+            >
+        </label>
+
+        {% for i in range(1, 8) %}
+        <fieldset>
+            <legend>Slot {{ i }}</legend>
+            <div class="grid">
+                <label for="slot{{ i }}">
+                    Ticker
+                    <input
+                        type="text"
+                        id="slot{{ i }}"
+                        name="slot{{ i }}_ticker"
+                        list="tickers_datalist"
+                        placeholder="Start typing to get relevant suggestions…"
+                        value="{{ selected.get(i) or '' }}"
+                        autocomplete="off"
+                        inputmode="latin"
+                        aria-label="Ticker for slot {{ i }}"
+                        style="margin-top:0.25rem;"
+                    >
+                </label>
+                
+                <button 
+                    type="button" 
+                    class="secondary" 
+                    onclick="document.getElementById('slot{{ i }}').value=''"
+                    style="margin-top: auto;"
+                >
+                    Clear
+                </button>
+            </div>
+        </fieldset>
+        {% endfor %}
+
+        <button type="submit">Save Selections</button>
+    </form>
+    <datalist id="tickers_datalist">
+        {% for t, label in tickers %}
+        <option value="{{ t }}">{{ label }}</option>
+        {% endfor %}
+    </datalist>
+</article>
+{% endblock %}

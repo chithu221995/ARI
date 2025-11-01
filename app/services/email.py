@@ -1,4 +1,5 @@
 from __future__ import annotations
+from email import message
 import json
 import os
 from email.message import EmailMessage
@@ -153,9 +154,9 @@ async def send_via_smtp(
     try:
         if aiosmtplib is None:
             # fallback to sync smtplib send (existing code path)
-            with smtplib.SMTP(host=smtp_host, port=smtp_port, timeout=30) as s:
+            with smtplib.SMTP(host=settings.SMTP_HOST, port=settings.SMTP_PORT, timeout=30) as s:
                 s.starttls()
-                s.login(smtp_user, smtp_pass)
+                s.login(settings.SMTP_USER, settings.SMTP_PASS)
                 s.sendmail(from_email, [to_email], message.as_string())
             elapsed_ms = int((time.time() - start_send) * 1000)
             try:
@@ -164,7 +165,7 @@ async def send_via_smtp(
                 log.exception("metrics: failed to record email smtp success metric")
             return {"ok": True}
         else:
-            await aiosmtplib.send(message, hostname=smtp_host, port=smtp_port, username=smtp_user, password=smtp_pass)
+            await aiosmtplib.send(message, hostname=settings.SMTP_HOST, port=settings.SMTP_PORT, username=settings.SMTP_USER, password=settings.SMTP_PASS)
             elapsed_ms = int((time.time() - start_send) * 1000)
             try:
                 record_metric("email", "smtp", elapsed_ms, True)

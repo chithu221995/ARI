@@ -1,11 +1,11 @@
-# Virtual Environment
-venv/
-
-# Secrets file
 .env
-
-# Others
+*.db
+*.sqlite
+ari.db
 __pycache__/
 *.pyc
+.venv/
+venv/
 .DS_Store
-.env.local
+logs/
+data/

@@ -1,5 +1,7 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+from click import Tuple
 
 from app.core import settings
 
@@ -739,3 +741,210 @@ async def llm_allow_request(db_path: str, provider: str, rpm_cap: int, daily_cap
         )
         await db.commit()
     return True, 0, False
+
+
+import aiosqlite  # ensure aiosqlite is available for new helpers
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _open_db_fk(path: str):
+    """
+    Async context manager that yields a fresh aiosqlite connection with
+    PRAGMA foreign_keys=ON. Use: async with _open_db_fk(path) as db:
+    """
+    db = await aiosqlite.connect(path)
+    try:
+        await db.execute("PRAGMA foreign_keys=ON;")
+        yield db
+    finally:
+        try:
+            await db.close()
+        except Exception:
+            pass
+
+
+async def ensure_users_schema(db_path: str) -> None:
+    async with _open_db_fk(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                email       TEXT PRIMARY KEY,
+                created_at  TEXT NOT NULL
+            )
+            """
+        )
+        await db.commit()
+
+
+async def ensure_user_tickers_schema(db_path: str) -> None:
+    async with _open_db_fk(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_tickers (
+                email         TEXT NOT NULL,
+                ticker        TEXT NOT NULL,
+                company_name  TEXT NOT NULL,
+                aliases_json  TEXT,       -- JSON string or NULL
+                rank          INTEGER NOT NULL, -- 1..7
+                created_at    TEXT NOT NULL,
+                FOREIGN KEY(email) REFERENCES users(email) ON DELETE CASCADE
+            )
+            """
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_user_tickers_email_rank  ON user_tickers(email, rank)"
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_user_tickers_email_tkr  ON user_tickers(email, ticker)"
+        )
+        await db.commit()
+
+
+async def ensure_ticker_catalog_schema(db_path: str) -> None:
+    async with _open_db_fk(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ticker_catalog (
+                ticker        TEXT PRIMARY KEY,
+                company_name  TEXT NOT NULL,
+                aliases_json  TEXT,       -- JSON array of strings or NULL
+                active        INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        await db.commit()
+
+
+async def ensure_runs_schema(db_path: str) -> None:
+    async with _open_db_fk(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job         TEXT NOT NULL,           -- fetch|extract|summarize|email
+                ticker      TEXT,                    -- nullable for email fan-out
+                started_at  TEXT NOT NULL,
+                ended_at    TEXT,
+                ok          INTEGER,                 -- 0/1
+                note        TEXT
+            )
+            """
+        )
+        await db.execute("CREATE INDEX IF NOT EXISTS ix_runs_job_started ON runs(job, started_at DESC)")
+        await db.commit()
+
+
+async def ensure_email_logs_schema(db_path: str) -> None:
+    async with _open_db_fk(db_path) as db:
+        # Create table first
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_logs (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                email        TEXT NOT NULL,
+                sent_at      TEXT NOT NULL,
+                subject      TEXT NOT NULL,
+                ok           INTEGER NOT NULL,       -- 0/1
+                error_msg    TEXT,
+                items_count  INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await db.commit()
+        
+        # Now create index (defensive: check if column exists first)
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS ix_email_logs_email_sent ON email_logs(email, sent_at DESC)")
+            await db.commit()
+        except Exception as e:
+            # If index creation fails (e.g., old schema missing column), log but don't crash
+            import logging
+            logging.getLogger("ari.cache").warning("email_logs index creation skipped: %s", e)
+
+
+async def ensure_phase4_user_catalog_schemas(db_path: str) -> None:
+    await ensure_users_schema(db_path)
+    await ensure_user_tickers_schema(db_path)
+    await ensure_ticker_catalog_schema(db_path)
+    await ensure_runs_schema(db_path)
+    await ensure_email_logs_schema(db_path)
+
+
+async def load_ticker_catalog_from_file(path: str, db_path: str = "./ari.db") -> int:
+    """
+    Load ticker catalog from a JSON file and upsert into ticker_catalog table.
+    
+    Expected JSON format:
+    [
+        {"ticker": "AAPL", "company_name": "Apple Inc.", "aliases": ["Apple", "AAPL"]},
+        ...
+    ]
+    
+    Returns the number of rows inserted/updated.
+    """
+    import json
+    
+    if not os.path.exists(path):
+        log.error("load_ticker_catalog_from_file: file not found: %s", path)
+        return 0
+    
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        log.exception("load_ticker_catalog_from_file: failed to parse JSON from %s", path)
+        return 0
+    
+    if not isinstance(data, list):
+        log.error("load_ticker_catalog_from_file: expected list, got %s", type(data))
+        return 0
+    
+    upsert_sql = """
+    INSERT INTO ticker_catalog (ticker, company_name, aliases_json, active)
+    VALUES (?, ?, ?, 1)
+    ON CONFLICT(ticker) DO UPDATE SET
+        company_name = excluded.company_name,
+        aliases_json = excluded.aliases_json,
+        active = excluded.active
+    """
+    
+    params = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        ticker = item.get("ticker")
+        company_name = item.get("company_name")
+        aliases = item.get("aliases", [])
+        
+        if not ticker or not company_name:
+            log.warning("load_ticker_catalog_from_file: skipping invalid item (missing ticker or company_name): %s", item)
+            continue
+        
+        # serialize aliases to JSON string
+        try:
+            aliases_json = json.dumps(aliases) if aliases else None
+        except Exception:
+            log.exception("load_ticker_catalog_from_file: failed to serialize aliases for ticker=%s", ticker)
+            aliases_json = None
+        
+        params.append((ticker, company_name, aliases_json))
+    
+    if not params:
+        log.info("load_ticker_catalog_from_file: no valid rows to insert from %s", path)
+        return 0
+    
+    try:
+        await ensure_ticker_catalog_schema(db_path)
+        async with _open_db_fk(db_path) as db:
+            before = getattr(db, "total_changes", 0)
+            await db.executemany(upsert_sql, params)
+            await db.commit()
+            after = getattr(db, "total_changes", 0)
+            changes = max(0, int(after - before))
+        
+        log.info("load_ticker_catalog_from_file: loaded=%d rows from %s to %s", changes, path, db_path)
+        return changes
+    except Exception:
+        log.exception("load_ticker_catalog_from_file: upsert failed for %s", path)
+        return 0

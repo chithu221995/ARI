@@ -1,38 +1,32 @@
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv()
-
+import sys
 import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+from contextlib import asynccontextmanager
 
+# Configure logging early to ensure all logs are captured
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
+logging.getLogger().handlers[0].flush = sys.stdout.flush  # ensure flush after each write
+
+import aiosqlite
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+
+from app.core.settings import settings
 from app.api import router as api_router
+from app.api.admin import jobs as jobs_admin
 
-app = FastAPI(title="ARI")
-app.include_router(api_router)
-
-# (startup handler must be registered after app = FastAPI())
-# (moved further down)
-
-import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-from fastapi import FastAPI
-import traceback
-
-# import composed admin package (single admin router)
-from app.api.admin import admin as admin_pkg
 # create the FastAPI app before mounting routers
 app = FastAPI(title="A.R.I. Engine")
-app.include_router(admin_pkg)
+app.include_router(api_router)
+# app.include_router(admin_pkg)
 
 # v1 routers
-from app.api.v1 import brief as v1_brief
-from app.api.v1 import summary as v1_summary
+# from app.api.v1 import brief as v1_brief
+# from app.api.v1 import summary as v1_summary
 
 # mount v1 routers
-app.include_router(v1_brief.router)        # /api/v1/brief
-app.include_router(v1_summary.router)      # /api/v1/summarize (GET+POST)
+# app.include_router(v1_brief.router)        # /api/v1/brief
+app.include_router(api_router)      # /api/v1/summarize (GET+POST)
 
 # debug API
 from app.api import debug as debug_api
@@ -40,10 +34,15 @@ from app.api import debug as debug_api
 if not any(getattr(r, "path", "") == "/debug/healthz" for r in app.router.routes):
     app.include_router(debug_api.router, prefix="/debug")
 
+# UI router
+from app.api import ui as ui_routes
+
+# Include UI router (place after other includes to avoid duplication)
+if not any(getattr(r, "path", "") == "/" for r in app.router.routes if hasattr(r, "path")):
+    app.include_router(ui_routes.router)
+
 # database initialization helpers (kept)
 import os
-import aiosqlite
-import logging
 log = logging.getLogger("ari.cache")
 
 async def _db_path() -> str:
@@ -113,3 +112,44 @@ __all__ = [
     "count_summaries_rows",
     "purge_expired",
 ]
+
+# --- Optional Lightweight Scheduler (guarded by RUN_SCHEDULER env var) ---
+import os
+from contextlib import suppress
+
+if os.getenv("RUN_SCHEDULER", "0") in {"1", "true", "yes"}:
+    # Minimal cron using asyncio.create_task + sleep loops to keep dependencies small
+    import asyncio
+    from datetime import datetime, time, timedelta, timezone
+    from app.pipeline.daily import run_daily_fanout
+    import logging
+    
+    log = logging.getLogger("ari.scheduler")
+
+    async def _sleep_until(ts: datetime):
+        now = datetime.now(timezone.utc)
+        delay = (ts - now).total_seconds()
+        await asyncio.sleep(max(0, delay))
+
+    async def _next_ist(hour: int, minute: int = 0):
+        # IST = UTC+5:30
+        ist = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(ist)
+        target = datetime.combine(now_ist.date(), time(hour, minute), tzinfo=ist)
+        if target <= now_ist:
+            target += timedelta(days=1)
+        return target.astimezone(timezone.utc)
+
+    async def scheduler_loop():
+        while True:
+            # Example: 06:00 IST daily
+            target_utc = await _next_ist(6, 0)
+            log.info("scheduler: next run at %s", target_utc.isoformat())
+            await _sleep_until(target_utc)
+            with suppress(Exception):
+                await run_daily_fanout()
+
+    @app.on_event("startup")
+    async def _start_scheduler():
+        asyncio.create_task(scheduler_loop())
+        log.info("scheduler: started")

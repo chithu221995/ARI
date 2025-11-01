@@ -11,7 +11,7 @@ from app.ingest.adapters.base import NewsItem, domain_from_url
 
 log = logging.getLogger("ari.fusion")
 # module import-time log of configured news sources (short, non-secret)
-log.info("fusion: NEWS_SOURCES=%s", settings.NEWS_SOURCES)
+# log.info("fusion: NEWS_SOURCES=%s", settings.NEWS_SOURCES)
 
 # map available adapters
 source_map = {

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}ARI Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@latest/css/pico.min.css">
+    <style>
+        /* Optional custom overrides */
+        .success { 
+            background: var(--pico-success-background, #d4edda); 
+            color: var(--pico-success-color, #155724); 
+            padding: 1rem; 
+            border-radius: var(--pico-border-radius); 
+            margin-bottom: 1rem; 
+        }
+    </style>
+</head>
+<body>
+    <main class="container">
+        <header>
+            <h1>{% block header %}ARI{% endblock %}</h1>
+        </header>
+        
+        {% if error %}
+        <article class="contrast">
+            <strong>Error:</strong> {{ error }}
+        </article>
+        {% endif %}
+        
+        {% block content %}{% endblock %}
+        
+        <footer style="margin-top: 2rem; text-align: center; color: var(--pico-muted-color);">
+            <small>&copy; 2025 ARI Dashboard</small>
+        </footer>
+    </main>
+</body>
+</html>

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ARI - Success</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .success { background: #d4edda; color: #155724; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        ul { list-style: none; padding: 0; }
+        li { padding: 8px; background: #f8f9fa; margin-bottom: 8px; border-radius: 4px; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="success">
+        <h1>✓ Selections Saved!</h1>
+        <p>Your ticker selections for <strong>{{ email }}</strong> have been saved.</p>
+    </div>
+    
+    <h2>Your Tickers:</h2>
+    <ul>
+        {% for item in saved_tickers %}
+        <li><strong>{{ item.rank }}.</strong> {{ item.ticker }} — {{ item.company_name }}</li>
+        {% endfor %}
+    </ul>
+    
+<article style="text-align: center; margin-top: 2rem;">
+    <p style="font-size: 1.2rem;">👍</p>
+    <p>Please expect your Asset Relevance Intelligence to be delivered to your inbox on weekdays between 9AM - 12 PM.</p>
+</article>
+</body>
+</html>

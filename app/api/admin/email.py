@@ -79,7 +79,6 @@ async def _load_summaries_for_ticker(ticker: str, hours: int = 48) -> List[Dict[
                     "title": r["title"],
                     "why_it_matters": r["why_it_matters"],
                     "sentiment": r["sentiment"],
-                    "relevance": r["relevance"],
                     "created_at": r["created_at"],
                 })
     return rows
@@ -171,4 +170,28 @@ async def email_brief_post(
         "dry_run": False,
         "provider_response": resp,
         "tickers": tickers,
+    }
+
+@router.post("/test", tags=["admin"])
+async def email_test(to: str):
+    """
+    Sends a tiny test email via the same path used for briefs.
+    """
+    from app.email.brief import send_brief_email
+    ok = await send_brief_email(email=to, tickers=["TCS"])  # minimal test
+    return {"ok": bool(ok)}
+
+
+@router.get("/config", tags=["admin"])
+def email_config():
+    """
+    Returns email configuration status without exposing secrets.
+    """
+    import os
+    prov = (os.getenv("EMAIL_PROVIDER") or "").lower()
+    frm = os.getenv("EMAIL_FROM") or ""
+    return {
+        "provider": prov,
+        "from_set": bool(frm),
+        "api_key_set": bool(os.getenv("SENDGRID_API_KEY"))
     }

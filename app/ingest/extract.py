@@ -196,22 +196,15 @@ async def extract_text(url: str, timeout_s: Optional[int] = None, provider: str 
 
     # Otherwise, attempt HTML/manual fallback only if allowed
     if allow_fallback:
-        # try common html extractor if available
+        # Use built-in fallback extractor
         try:
-            # import lazily to avoid circular imports when module not present
-            from .html_extract import extract_via_html  # optional helper
-        except Exception:
-            extract_via_html = None
-
-        if extract_via_html:
-            try:
-                html_text = await extract_via_html(url, timeout_s=timeout_s)
+            ok, html_text, _title = await extract_with_fallback(url, timeout_s=timeout_s)
+            if ok and html_text:
+                html_text = html_text.strip()
                 if html_text:
-                    html_text = html_text.strip()
-                    if html_text:
-                        return html_text, "html"
-            except Exception:
-                log.exception("extract_text: html fallback failed for %s", url)
+                    return html_text, "html"
+        except Exception:
+            log.exception("extract_text: html fallback failed for %s", url)
 
     # nothing succeeded
     return "", None

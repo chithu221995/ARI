@@ -64,14 +64,14 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-import logging
-logging.getLogger("ari.settings").info(
-    "ari.settings: LLM_PROVIDER=%s NEWS_SOURCES=%s SUMMARY_MAX_TOKENS=%s SUMMARY_TEMPERATURE=%s",
-    getattr(settings, "LLM_PROVIDER", None),
-    getattr(settings, "NEWS_SOURCES", None),
-    getattr(settings, "SUMMARY_MAX_TOKENS", None),
-    getattr(settings, "SUMMARY_TEMPERATURE", None),
-)
+# import logging
+# logging.getLogger("ari.settings").info(
+#     "ari.settings: LLM_PROVIDER=%s NEWS_SOURCES=%s SUMMARY_MAX_TOKENS=%s SUMMARY_TEMPERATURE=%s",
+#     getattr(settings, "LLM_PROVIDER", None),
+#     getattr(settings, "NEWS_SOURCES", None),
+#     getattr(settings, "SUMMARY_MAX_TOKENS", None),
+#     getattr(settings, "SUMMARY_TEMPERATURE", None),
+# )
 
 # Back-compat: expose validated NEWS_SOURCES at module level for callers importing the module
 NEWS_SOURCES = settings.NEWS_SOURCES
