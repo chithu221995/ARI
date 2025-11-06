@@ -6,6 +6,8 @@ import httpx
 import time
 from typing import Optional, Tuple, List, Dict, Any
 from app.observability.metrics import record_metric
+from app.core.metrics import record_vendor_event
+from app.core.retry_utils import rate_limited_retry  # ADD THIS
 
 import trafilatura
 
@@ -27,26 +29,56 @@ async def extract_via_diffbot(url: str, timeout_s: Optional[int] = None) -> Opti
     t0 = time.time()
     ok = False
     text = None
+    
+    # ADD DEBUG
+    log.info(f"extract.diffbot: starting extraction for url={url}")
+    
     try:
         ok_diffbot, text, _title = await extract_with_diffbot(url, timeout_s=timeout_s)
+        
+        # ADD DEBUG
+        log.info(f"extract.diffbot: raw response ok={ok_diffbot} has_text={bool(text)} text_len={len(text) if text else 0}")
+        
         ok = bool(ok_diffbot and text)
+        
+        # ADD DEBUG
+        if not ok:
+            log.warning(f"extract.diffbot: marked as failed - ok_diffbot={ok_diffbot} text={'present' if text else 'missing'}")
+        
         return text
-    except Exception:
+    except Exception as e:
+        log.error(f"extract.diffbot: exception for url={url}: {e}", exc_info=True)
         raise
     finally:
         try:
             lat_ms = int((time.time() - t0) * 1000)
-            log.info("extract: metric fired for %s ok=%s", url, ok)
-            record_metric("extract", "diffbot", lat_ms, ok=ok)
+            
+            # Record the event
+            record_vendor_event(
+                provider="diffbot",
+                event="extract_article",
+                ok=ok,
+                latency_ms=lat_ms
+            )
+            
+            log.info(f"extract.diffbot: recorded metric for url={url} ok={ok} latency={lat_ms}ms")
+        except Exception as e:
+            log.error(f"extract.diffbot: failed to record metric: {e}", exc_info=True)
         except Exception:
-            import logging
             logging.getLogger("ari.metrics").exception("metrics: failed to record diffbot extract metric")
 
 
+@rate_limited_retry(
+    provider="diffbot",
+    max_retries=2,
+    base_delay=1.5,
+    max_per_minute=5,  # Changed from 10 to 5
+    retry_on=(httpx.RequestError, httpx.TimeoutException, TimeoutError, ConnectionError)
+)
 async def extract_with_diffbot(url: str, timeout_s: Optional[int] = None) -> Tuple[bool, str, str]:
     """
-    Call Diffbot Analyze API. Return (ok, text, title).
-    Raises _TransientError on retryable HTTP statuses (429, 5xx).
+    Call Diffbot Analyze API with automatic retries and rate limiting.
+    Return (ok, text, title).
     """
     if not url:
         return False, "", ""
@@ -60,35 +92,30 @@ async def extract_with_diffbot(url: str, timeout_s: Optional[int] = None) -> Tup
     endpoint = "https://api.diffbot.com/v3/analyze"
     params = {"token": token, "url": url}
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(endpoint, params=params)
-            status = r.status_code
-            if status == 200:
-                data = r.json()
-                objs = data.get("objects") or []
-                if not objs:
-                    log.info("diffbot.extract: no objects for %s", url)
-                    return False, "", ""
-                obj = objs[0] or {}
-                text = obj.get("text") or ""
-                if not text:
-                    log.info("diffbot.extract: empty text for %s", url)
-                    return False, "", ""
-                title = obj.get("title") or obj.get("pageTitle") or ""
-                lang = obj.get("language") or data.get("language") or None
-                # do not perform language enforcement here; caller may decide
-                return True, text, title or ""
-            if status == 429 or 500 <= status < 600:
-                # retryable
-                raise _TransientError(status)
-            # non-retryable failure
-            log.info("diffbot.extract: non-200 %d for %s", status, url)
-            return False, "", ""
-    except _TransientError:
-        raise
-    except Exception as e:
-        log.info("diffbot.extract: request failed for %s: %s", url, e)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(endpoint, params=params)
+        status = r.status_code
+        
+        if status == 200:
+            data = r.json()
+            objs = data.get("objects") or []
+            if not objs:
+                log.info("diffbot.extract: no objects for %s", url)
+                return False, "", ""
+            obj = objs[0] or {}
+            text = obj.get("text") or ""
+            if not text:
+                log.info("diffbot.extract: empty text for %s", url)
+                return False, "", ""
+            title = obj.get("title") or obj.get("pageTitle") or ""
+            return True, text, title or ""
+        
+        # Let retry decorator handle 429 and 5xx
+        if status == 429 or 500 <= status < 600:
+            r.raise_for_status()  # Will be caught and retried
+        
+        # Non-retryable failure
+        log.info("diffbot.extract: non-200 %d for %s", status, url)
         return False, "", ""
 
 

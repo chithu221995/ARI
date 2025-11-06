@@ -18,3 +18,8 @@ logs/
 data/
 .venv/
 venv/
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+venv/

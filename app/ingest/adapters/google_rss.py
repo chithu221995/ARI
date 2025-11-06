@@ -4,6 +4,7 @@ from typing import List
 
 from app.ingest.adapters.base import NewsItem, normalize_item
 from app.ingest.google_rss_scrapingdog import search_google_news_scrapingdog
+from app.utils.dates import parse_relative_age_to_hours
 
 log = logging.getLogger("ari.ingest.google_rss")
 
@@ -11,11 +12,11 @@ log = logging.getLogger("ari.ingest.google_rss")
 async def fetch(ticker: str, *, days: int, topk: int, timeout_s: int) -> List[NewsItem]:
     """
     Adapter shim that queries ScrapingDog google_news and returns List[NewsItem].
+    Now captures news_age in hours from lastUpdated field.
     """
     log.info("google_rss.fetch: start ticker=%s days=%d top_k=%d", ticker, days, topk)
-    # try to fetch using scrapingdog helper
+
     try:
-        # aliases not available here; pass empty list (higher-level callers may pre-resolve)
         raw = await search_google_news_scrapingdog(
             ticker, aliases=[], topk=topk, country="in", timeout_s=timeout_s
         )
@@ -27,24 +28,25 @@ async def fetch(ticker: str, *, days: int, topk: int, timeout_s: int) -> List[Ne
 
     items: List[NewsItem] = []
     for r in (raw or [])[:topk]:
+        # Parse news age from lastUpdated field
+        last_updated = r.get("published_hint") or ""
+        news_age_hours = parse_relative_age_to_hours(last_updated) if last_updated else None
+
+        if news_age_hours is not None:
+            log.debug(f"Parsed '{last_updated}' -> {news_age_hours} hours")
+
         ni = {
             "title": r.get("title", "") or "",
             "url": r.get("url", "") or "",
             "source": (r.get("source") or "").strip(),
-            "published_at": r.get("published_hint") or "",
+            "published_at": last_updated,  # Keep original for reference
+            "news_age": news_age_hours,  # NEW: Store parsed age in hours
             "lang": "en",
             "content": r.get("snippet") or "",
         }
         items.append(normalize_item(ni))
 
     kept = len(items)
-    dropped = max(0, (len(raw or []) - kept))
-    log.info("google_rss.fetch: kept=%d dropped=%d for %s (applied top_k=%d)", kept, dropped, ticker, topk)
-    # log one sample item safely truncated
-    if items:
-        ex = items[0]
-        sample_title = (ex.get("title") or "")[:200]
-        sample_url = ex.get("url") or ""
-        log.info("google_rss.fetch: sample title=%r url=%s", sample_title, sample_url)
+    log.info("google_rss.fetch: kept=%d for %s", kept, ticker)
 
     return items

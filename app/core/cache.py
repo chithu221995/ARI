@@ -192,69 +192,82 @@ async def ensure_summaries_schema(db_path: str) -> None:
 
 
 # New helpers for upserting and reading cached items (news/articles and filings)
-async def cache_upsert_items(rows: list[dict]) -> int:
+async def cache_upsert_items(
+    rows: List[Dict[str, Any]],
+    kind: str = "news",
+    ticker: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> int:
     """
-    Upsert article stub rows into the articles table.
-    Expects each row to contain keys:
-      ticker, title, url, url_hash, source, published_at, lang, content, created_at
-    Returns number of DB changes (int).
+    Upsert news/filing items into cache.
+    Now stores news_age (hours) from fetch time.
     """
+    if not db_path:
+        db_path = CACHE_DB_PATH
+    
     if not rows:
         return 0
-
-    db_path = getattr(settings, "CACHE_DB_PATH", "./ari.db")
-    insert_sql = """
-    INSERT INTO articles
-      (ticker, title, url, url_hash, source, published_at, lang, content, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(url_hash) DO UPDATE SET
-      ticker = excluded.ticker,
-      title = excluded.title,
-      url = excluded.url,
-      source = excluded.source,
-      published_at = excluded.published_at,
-      lang = COALESCE(excluded.lang, articles.lang),
-      content = COALESCE(articles.content, excluded.content),
-      created_at = articles.created_at
-    ;
-    """
-
+    
+    now = now_iso()
     params = []
+    
     for r in rows:
-        params.append(
-            (
-                r.get("ticker"),
-                r.get("title"),
-                r.get("url"),
-                r.get("url_hash"),
-                r.get("source"),
-                r.get("published_at"),
-                r.get("lang"),
-                r.get("content"),
-                r.get("created_at"),
-            )
-        )
-
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue
+        
+        h = url_hash(url)
+        t = (ticker or r.get("ticker") or "").strip().upper()
+        source = (r.get("source") or "").strip()
+        title = (r.get("title") or "").strip()
+        published_at = (r.get("published_at") or "").strip()
+        news_age = r.get("news_age")  # NEW: Get news_age in hours
+        lang = (r.get("lang") or "en").strip()
+        content = (r.get("content") or "").strip()
+        translated_text = (r.get("translated_text") or "").strip()
+        
+        params.append((
+            url,
+            h,
+            t,
+            source,
+            title,
+            published_at,
+            news_age,  # NEW: Store age in hours
+            lang,
+            content,
+            translated_text,
+            now,
+        ))
+    
+    if not params:
+        return 0
+    
     try:
-        # ensure schema exists (idempotent) before opening the connection used for the measured upsert
-        await ensure_articles_schema(db_path)
-
-        # perform upserts using a single connection and measure total_changes before/after
         async with aiosqlite.connect(db_path) as db:
-            # ensure we have a fresh connection whose total_changes we can measure
-            db.row_factory = aiosqlite.Row
-            before = getattr(db, "total_changes", 0)
-
-            await db.executemany(insert_sql, params)
+            await db.executemany(
+                """
+                INSERT INTO articles
+                (url, url_hash, ticker, source, title, published_at, news_age, lang, content, translated_text, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url_hash) DO UPDATE SET
+                    title=excluded.title,
+                    source=excluded.source,
+                    published_at=excluded.published_at,
+                    news_age=excluded.news_age,
+                    lang=excluded.lang,
+                    content=COALESCE(excluded.content, articles.content),
+                    translated_text=COALESCE(excluded.translated_text, articles.translated_text)
+                """,
+                params
+            )
             await db.commit()
-
-            after = getattr(db, "total_changes", 0)
-            changes = max(0, int(after - before))
-
-        log.info("cache_upsert_items: rows_in=%d changes=%d db=%s", len(params), changes, db_path)
-        return changes
-    except Exception:
-        log.exception("cache_upsert_items: upsert failed")
+        
+        log.info(f"cache_upsert_items: upserted {len(params)} rows with news_age")
+        return len(params)
+        
+    except Exception as e:
+        log.exception("cache_upsert_items: failed")
         return 0
 
 
@@ -613,6 +626,8 @@ __all__ = [
     "count_summaries_rows",
     "set_meta",
     "get_meta",
+    "get_cached_summary",      # NEW
+    "get_cached_articles",     # NEW
 ]
 
 
@@ -948,3 +963,167 @@ async def load_ticker_catalog_from_file(path: str, db_path: str = "./ari.db") ->
     except Exception:
         log.exception("load_ticker_catalog_from_file: upsert failed for %s", path)
         return 0
+
+
+# Add these new functions at the end of the file (before __all__):
+
+async def get_cached_summary(
+    ticker: str, 
+    max_age_hours: int = 12,
+    db_path: str | None = None
+) -> dict[str, Any] | None:
+    """
+    Retrieve the most recent cached summary for a ticker within max_age_hours.
+    
+    Args:
+        ticker: Stock ticker symbol
+        max_age_hours: Maximum age of cached entry in hours (default: 12)
+        db_path: Optional database path (defaults to CACHE_DB_PATH)
+        
+    Returns:
+        Dict with summary data if found, None otherwise
+    """
+    if not db_path:
+        db_path = CACHE_DB_PATH
+    
+    cutoff = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat() + "Z"
+    
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            query = """
+                SELECT 
+                    item_url_hash,
+                    ticker,
+                    title,
+                    url,
+                    why_it_matters,
+                    bullets,
+                    sentiment,
+                    relevance,
+                    created_at
+                FROM summaries
+                WHERE ticker = ?
+                  AND created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 5
+            """
+            
+            async with db.execute(query, (ticker, cutoff)) as cur:
+                rows = await cur.fetchall()
+            
+            if not rows:
+                return None
+            
+            # Return list of recent summaries
+            items = []
+            for row in rows:
+                bullets_raw = row["bullets"] or ""
+                try:
+                    import json
+                    bullets = json.loads(bullets_raw) if bullets_raw else []
+                except Exception:
+                    bullets = []
+                
+                items.append({
+                    "url": row["url"] or "",
+                    "url_hash": row["item_url_hash"] or "",
+                    "title": row["title"] or "",
+                    "why_it_matters": row["why_it_matters"] or "",
+                    "bullets": bullets,
+                    "sentiment": row["sentiment"] or "Neutral",
+                    "relevance": row["relevance"] or 5,
+                    "created_at": row["created_at"]
+                })
+            
+            age_hours = round((datetime.utcnow() - datetime.fromisoformat(items[0]["created_at"].replace("Z", ""))).total_seconds() / 3600, 1)
+            
+            log.info(f"get_cached_summary: found {len(items)} summaries for {ticker} (age={age_hours}h)")
+            
+            return {
+                "ok": True,
+                "items": items,
+                "cached": True,
+                "age_hours": age_hours,
+                "ticker": ticker
+            }
+            
+    except Exception as e:
+        log.exception(f"get_cached_summary: failed for ticker={ticker}")
+        return None
+
+
+async def get_cached_articles(
+    ticker: str,
+    max_age_hours: int = 12,
+    db_path: str | None = None
+) -> list[dict[str, Any]] | None:
+    """
+    Retrieve recent cached articles with content for a ticker.
+    
+    Args:
+        ticker: Stock ticker symbol
+        max_age_hours: Maximum age of cached entry in hours (default: 12)
+        db_path: Optional database path (defaults to CACHE_DB_PATH)
+        
+    Returns:
+        List of article dicts if found, None otherwise
+    """
+    if not db_path:
+        db_path = CACHE_DB_PATH
+    
+    cutoff = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat() + "Z"
+    
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            query = """
+                SELECT 
+                    url,
+                    url_hash,
+                    title,
+                    content,
+                    source,
+                    published_at,
+                    lang,
+                    created_at
+                FROM articles
+                WHERE ticker = ?
+                  AND created_at >= ?
+                  AND content IS NOT NULL
+                  AND LENGTH(content) > 500
+                ORDER BY created_at DESC
+                LIMIT 10
+            """
+            
+            async with db.execute(query, (ticker, cutoff)) as cur:
+                rows = await cur.fetchall()
+            
+            if not rows:
+                return None
+            
+            articles = []
+            for row in rows:
+                articles.append({
+                    "url": row["url"] or "",
+                    "url_hash": row["url_hash"] or "",
+                    "title": row["title"] or "",
+                    "content": row["content"] or "",
+                    "translated_text": row["content"] or "",  # For compatibility with summarizer
+                    "source": row["source"] or "",
+                    "published_at": row["published_at"] or "",
+                    "lang": row["lang"] or "en",
+                    "created_at": row["created_at"]
+                })
+            
+            age_hours = round((datetime.utcnow() - datetime.fromisoformat(articles[0]["created_at"].replace("Z", ""))).total_seconds() / 3600, 1)
+            
+            log.info(f"get_cached_articles: found {len(articles)} articles for {ticker} (age={age_hours}h)")
+            
+            return articles
+            
+    except Exception as e:
+        log.exception(f"get_cached_articles: failed for ticker={ticker}")
+        return None

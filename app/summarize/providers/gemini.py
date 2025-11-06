@@ -5,6 +5,10 @@ import json
 import re
 from typing import Any
 import httpx
+import time
+
+from app.core.metrics import record_vendor_event
+from app.core.retry_utils import rate_limited_retry, RetryExhausted  # ADD THIS
 
 log = logging.getLogger("ari.summarize.gemini")
 
@@ -27,6 +31,12 @@ def _auth_headers(api_key: str) -> dict[str, str]:
 class GeminiRateLimitError(Exception):
     pass
 
+@rate_limited_retry(
+    provider="gemini",
+    max_retries=3,
+    base_delay=1.0,
+    max_per_minute=5
+)
 async def summarize(
     payload_text: str,
     system_prompt: str,
@@ -35,59 +45,47 @@ async def summarize(
     temperature: float = 0.2,
 ) -> str:
     """
-    Call Gemini REST (v1beta) generateContent.
-    - Auth: x-goog-api-key header when GEMINI_API_KEY is an API key; otherwise treat it as OAuth Bearer.
-    - Body: uses system_instruction + contents (no legacy "prompt" field).
-    - Returns assistant text (empty string on failure).
-    - Raises GeminiRateLimitError on 429 / quota responses so callers can fallback to OpenAI.
+    Call Gemini REST with automatic retries and rate limiting.
     """
     if not GEMINI_API_KEY:
         log.error("gemini.summarize: GEMINI_API_KEY not configured")
-        return ""
+        raise ValueError("GEMINI_API_KEY not configured")
 
-    # Endpoint & headers
     url = f"{GEMINI_BASE.rstrip('/')}/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {"Content-Type": "application/json"}
     headers.update(_auth_headers(GEMINI_API_KEY))
 
-    # Request payload: put rules in system_instruction; article bundle in user content
-    prompt = (system_prompt or "").strip() + "\n\n" + (payload_text or "").strip()
-
-    # guarded debug: indicate whether a system_instruction was provided and a short safe snippet (no secrets)
-    if log.isEnabledFor(logging.DEBUG):
-        sys_text = (system_prompt or "").strip()
-        sys_present = bool(sys_text)
-        sys_snippet = sys_text[:80] if sys_text else ""
-        log.debug("gemini.summarize: system_instruction_present=%s system_snippet=%r", sys_present, sys_snippet)
-
     body = {
-    "system_instruction": {
-        "parts": [{"text": system_prompt or ""}]
-    },
-    "contents": [
-        {
-            "parts": [{"text": payload_text or ""}]
+        "system_instruction": {
+            "parts": [{"text": system_prompt or ""}]
+        },
+        "contents": [
+            {
+                "parts": [{"text": payload_text or ""}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": float(temperature or 0.0),
+            "maxOutputTokens": int(max_tokens or 1024)
         }
-    ],
-    "generationConfig": {
-        "temperature": float(temperature or 0.0),
-        "maxOutputTokens": int(max_tokens or 1024)
     }
-}
+
+    start_time = time.perf_counter()
+    ok = False
+    result = ""
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(url, json=body, headers=headers)
+            
+            # Let retry decorator handle 429
             if r.status_code == 429:
-                # Trigger caller fallback path
-                log.warning("gemini.summarize: rate limited (429); body=%s", r.text[:400])
-                raise GeminiRateLimitError("gemini rate limited (429)")
-            if not (200 <= r.status_code < 300):
-                # Log the first ~400 chars of the error for diagnosis
-                log.error("gemini.summarize: HTTP %s; body=%s", r.status_code, r.text[:400])
+                log.warning("gemini.summarize: rate limited (429)")
+                r.raise_for_status()  # Will be caught and retried
+            
             r.raise_for_status()
             j = r.json()
-            # Happy path: candidates[0].content.parts[0].text
+
             try:
                 cands = j.get("candidates") or []
                 if cands and isinstance(cands, list):
@@ -96,30 +94,43 @@ async def summarize(
                     if parts and isinstance(parts, list):
                         txt = (parts[0].get("text") or "").strip()
 
-                        # strip fenced json blocks ```json ... ``` or ``` ... ```
                         m = re.search(r'```(?:json)?\s*(.*?)\s*```', txt, flags=re.S | re.I)
                         if m:
                             txt = m.group(1).strip()
 
-                        # verify JSON-ish (best-effort); warn if not valid but still return raw string
-                        try:
-                            json.loads(txt)
-                        except Exception:
-                            log.warning("gemini.summarize: response not valid JSON after stripping fences")
-                        return txt or ""
+                        result = txt or ""
+                        ok = True
+                        return result
             except Exception:
-                # Fall through to alternative fields below
                 pass
 
-            # Secondary fallbacks for older/atypical responses; strip fences if present
-            fallback = (j.get("output", "") or j.get("text", "") or "")
-            fallback = (fallback or "").strip()
+            fallback = (j.get("output", "") or j.get("text", "") or "").strip()
             m2 = re.search(r'```(?:json)?\s*(.*?)\s*```', fallback, flags=re.S | re.I)
             if m2:
                 fallback = m2.group(1).strip()
-            return fallback or ""
-    except GeminiRateLimitError:
+            result = fallback or ""
+            ok = bool(result)
+            
+            if not ok:
+                raise ValueError("Empty response from Gemini")
+            
+            return result
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            raise  # Let retry decorator handle
+        log.error("gemini.summarize: HTTP error %d", e.response.status_code)
+        ok = False
         raise
     except Exception as e:
         log.exception("gemini.summarize: request failed: %s", e)
-        return ""
+        ok = False
+        raise
+    finally:
+        latency_ms = int((time.perf_counter() - start_time) * 1000)
+        record_vendor_event(
+            provider="gemini",
+            event="summarize",
+            ok=ok,
+            latency_ms=latency_ms
+        )

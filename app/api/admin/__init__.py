@@ -2,7 +2,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 # import child routers (these should define `router` as APIRouter)
-from . import jobs, email, cache_diag, metrics  # type: ignore
+from . import jobs, cache_diag, metrics, email  # ensure all modules are imported
 
 admin = APIRouter(prefix="/admin", tags=["admin"])
 

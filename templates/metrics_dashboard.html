@@ -1,0 +1,1468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - ARI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        
+        header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .controls label {
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .controls input[type="date"] {
+            padding: 8px 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+            min-width: 150px;
+        }
+        
+        .controls button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+            white-space: nowrap;
+        }
+        
+        .controls button:hover {
+            transform: translateY(-2px);
+        }
+        
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .kpi-card {
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            border-left: 4px solid #667eea;
+            min-width: 260px;
+            transition: opacity 0.3s ease-in-out;
+        }
+        
+        .kpi-card.loading {
+            opacity: 0.6;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        /* Shimmer effect for loading cards */
+        .kpi-card.loading::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(
+                90deg,
+                rgba(255, 255, 255, 0) 0%,
+                rgba(255, 255, 255, 0.4) 50%,
+                rgba(255, 255, 255, 0) 100%
+            );
+            animation: shimmer 1.5s infinite;
+        }
+        
+        @keyframes shimmer {
+            0% {
+                left: -100%;
+            }
+            100% {
+                left: 100%;
+            }
+        }
+        
+        .kpi-card h3 {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .kpi-card .value {
+            font-size: 32px;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 8px;
+        }
+        
+        .kpi-card .subtitle {
+            font-size: 13px;
+            color: #999;
+            margin-bottom: 12px;
+        }
+        
+        .kpi-card .sparkline-container {
+            height: 40px;
+            margin-top: 8px;
+            opacity: 0;
+            transition: opacity 0.3s ease-in-out;
+        }
+        
+        .kpi-card .sparkline-container.loaded {
+            opacity: 1;
+        }
+        
+        .section {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        
+        .section h2 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            color: #333;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 10px;
+        }
+        
+        .section h3 {
+            font-size: 18px;
+        }
+        
+        .chart-placeholder {
+            height: 300px;
+            background: linear-gradient(135deg, #f5f7fa 0%, #e8edf5 100%);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #999;
+            font-style: italic;
+        }
+        
+        /* Make all canvas elements responsive */
+        canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+        
+        /* Chart containers need explicit height with consistent margins */
+        .chart-container {
+            position: relative;
+            height: 300px;
+            width: 100%;
+            overflow: hidden;
+            margin-top: 16px;
+            margin-bottom: 24px;
+        }
+        
+        .metrics-grid .chart-container:first-child {
+            margin-top: 0;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            overflow-x: auto;
+            display: block;
+        }
+        
+        table thead,
+        table tbody {
+            display: table;
+            width: 100%;
+            table-layout: fixed;
+        }
+        
+        table th {
+            background: #f5f7fa;
+            padding: 12px;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 600;
+            color: #666;
+            border-bottom: 2px solid #e0e0e0;
+        }
+        
+        table td {
+            padding: 12px;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 14px;
+        }
+        
+        table tr:hover {
+            background: #f9f9f9;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .status-success {
+            background: #e7f9f0;
+            color: #2d6a4f;
+        }
+        
+        .status-warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .status-error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(102, 126, 234, 0.3);
+            border-radius: 50%;
+            border-top-color: #667eea;
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .error-message {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #dc3545;
+        }
+        
+        /* Skeleton loader for cards */
+        .skeleton {
+            background: linear-gradient(
+                90deg,
+                #f0f0f0 25%,
+                #e0e0e0 50%,
+                #f0f0f0 75%
+            );
+            background-size: 200% 100%;
+            animation: skeleton-loading 1.5s infinite;
+            border-radius: 4px;
+        }
+        
+        .skeleton-text {
+            height: 16px;
+            margin-bottom: 8px;
+        }
+        
+        .skeleton-value {
+            height: 36px;
+            width: 60%;
+            margin-bottom: 12px;
+        }
+        
+        @keyframes skeleton-loading {
+            0% {
+                background-position: 200% 0;
+            }
+            100% {
+                background-position: -200% 0;
+            }
+        }
+        
+        /* Mobile responsive styles */
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+                font-size: 14px;
+            }
+            
+            header {
+                padding: 20px;
+                margin-bottom: 20px;
+            }
+            
+            header h1 {
+                font-size: 20px;
+            }
+            
+            header p {
+                font-size: 12px;
+            }
+            
+            .controls {
+                padding: 15px;
+                gap: 10px;
+                margin-bottom: 20px;
+            }
+            
+            .controls label {
+                width: 100%;
+                margin-top: 10px;
+                font-size: 13px;
+            }
+            
+            .controls input[type="date"] {
+                width: 100%;
+                font-size: 13px;
+            }
+            
+            .controls button {
+                width: 100%;
+                margin-top: 5px;
+                font-size: 13px;
+                padding: 9px 20px;
+            }
+            
+            .kpi-grid {
+                grid-template-columns: 1fr;
+                gap: 18px;
+                margin-bottom: 20px;
+            }
+            
+            .kpi-card {
+                min-width: unset;
+                padding: 18px;
+            }
+            
+            .kpi-card h3 {
+                font-size: 12px;
+            }
+            
+            .kpi-card .value {
+                font-size: 26px;
+            }
+            
+            .kpi-card .subtitle {
+                font-size: 12px;
+            }
+            
+            .section {
+                padding: 18px;
+                margin-bottom: 20px;
+            }
+            
+            .section h2 {
+                font-size: 17px;
+                margin-bottom: 16px;
+            }
+            
+            .section h3 {
+                font-size: 16px;
+                margin: 6px 0 10px 0;
+            }
+            
+            /* Chart containers with consistent margins on mobile */
+            .chart-container {
+                height: 280px;
+                margin-top: 14px;
+                margin-bottom: 20px;
+            }
+            
+            .metrics-grid .chart-container:first-child {
+                margin-top: 0;
+            }
+            
+            /* Make charts stack vertically on mobile */
+            .metrics-grid > div:last-child {
+                grid-template-columns: 1fr !important;
+            }
+            
+            /* Table responsive */
+            table {
+                font-size: 11px;
+            }
+            
+            table th,
+            table td {
+                padding: 8px 4px;
+                font-size: 11px;
+            }
+            
+            .status-badge {
+                font-size: 10px;
+                padding: 3px 8px;
+            }
+        }
+        
+        /* Tablet responsive styles */
+        @media (min-width: 769px) and (max-width: 1024px) {
+            body {
+                font-size: 15px;
+            }
+            
+            header h1 {
+                font-size: 24px;
+            }
+            
+            header p {
+                font-size: 13px;
+            }
+            
+            .controls label {
+                font-size: 13px;
+            }
+            
+            .controls button {
+                font-size: 13px;
+                padding: 9px 20px;
+            }
+            
+            .kpi-grid {
+                grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                gap: 18px;
+                margin-bottom: 24px;
+            }
+            
+            .kpi-card {
+                padding: 20px;
+            }
+            
+            .kpi-card h3 {
+                font-size: 13px;
+            }
+            
+            .kpi-card .value {
+                font-size: 28px;
+            }
+            
+            .section {
+                padding: 24px;
+                margin-bottom: 24px;
+            }
+            
+            .section h2 {
+                font-size: 19px;
+            }
+            
+            .section h3 {
+                font-size: 17px;
+            }
+            
+            /* Chart containers with consistent margins on tablet */
+            .chart-container {
+                height: 290px;
+                margin-top: 16px;
+                margin-bottom: 22px;
+            }
+            
+            .metrics-grid > div:last-child {
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            }
+            
+            table th,
+            table td {
+                font-size: 13px;
+            }
+        }
+        
+        /* Large screen optimizations */
+        @media (min-width: 1400px) {
+            .kpi-grid {
+                grid-template-columns: repeat(5, 1fr);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header">
+                <h1>📊 ARI Metrics Dashboard</h1>
+                <div class="header-links">
+                    <a href="/admin/errors" style="color:white;margin-right:20px;">🚨 View Errors</a>
+                    <a href="/admin/cache/diag" style="color:white;">🔧 Cache Diagnostics</a>
+                </div>
+            </div>
+        </header>
+        
+        <div class="controls">
+            <label for="start-date">Start Date:</label>
+            <input type="date" id="start-date" value="{{ start }}">
+            
+            <label for="end-date">End Date:</label>
+            <input type="date" id="end-date" value="{{ end }}">
+            
+            <button onclick="updateDashboard()">Refresh Dashboard</button>
+            <button onclick="setQuickRange(7)" style="background: #6c757d;">Last 7 Days</button>
+            <button onclick="setQuickRange(30)" style="background: #6c757d;">Last 30 Days</button>
+        </div>
+        
+        <div id="error-container"></div>
+        
+        <div id="kpi-cards" class="kpi-grid">
+            <!-- KPI cards will be populated here -->
+            <div class="kpi-card loading">
+                <div class="skeleton skeleton-text" style="width: 60%;"></div>
+                <div class="skeleton skeleton-value"></div>
+                <div class="skeleton skeleton-text" style="width: 40%;"></div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>📈 Delivery Metrics</h2>
+            <div class="metrics-grid">
+                <div class="chart-container" style="margin-bottom: 18px;">
+                    <canvas id="sendSuccessChart"></canvas>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px;">
+                    <div>
+                        <h3 style="margin: 6px 0 10px 0; color:#333;">Avg Rating (trend)</h3>
+                        <div class="chart-container">
+                            <canvas id="ratingChart"></canvas>
+                        </div>
+                    </div>
+                    <div>
+                        <h3 style="margin: 6px 0 10px 0; color:#333;">₹ Cost per Delivered Item (trend)</h3>
+                        <div class="chart-container">
+                            <canvas id="costChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- NEW: Summary KPIs (shown above ticker table) -->
+        <div class="section" id="summary-kpi-section" style="margin-bottom:18px;">
+            <h2>📋 Summary</h2>
+            <div id="summary-kpis" class="kpi-grid">
+                <!-- Filled by JS: total_users, total_tickers_selected, total_unique_tickers_selected,
+                     total_emails_sent, avg_emails_sent_per_user, total_bounced, total_delivered,
+                     total_opened (pct), avg_open_time -->
+                <div class="kpi-card loading">
+                    <div class="skeleton skeleton-text" style="width: 60%;"></div>
+                    <div class="skeleton skeleton-value"></div>
+                    <div class="skeleton skeleton-text" style="width: 40%;"></div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- NEW: Ticker vs Avg Age table -->
+        <div class="section" id="ticker-age-section">
+            <h2>🕐 Ticker Analysis</h2>
+            <div id="ticker-age-container" class="table-container" style="padding:0;">
+                <table id="ticker-age-table">
+                    <thead>
+                        <tr>
+                            <th>Ticker</th>
+                            <th>Articles</th>
+                            <th>Avg Hours</th>
+                            <th>Articles Sent</th>
+                            <th>Avg Hours (Sent)</th>
+                            <th>Avg Relevance (Sent)</th>
+                            <th>Users</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td colspan="7" style="text-align:center; padding:20px;"><span class="loading-spinner"></span> Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>⚙️ Vendor Performance</h2>
+            <table id="vendor-table">
+                <thead>
+                    <tr>
+                        <th>Provider</th>
+                        <th>Event</th>
+                        <th>Total Calls</th>
+                        <th>Success Rate</th>
+                        <th>Avg Latency (ms)</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td colspan="6" style="text-align: center; padding: 40px;">
+                            <span class="loading-spinner"></span> Loading vendor data...
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+/* ---------- globals ---------- */
+const sparklineCharts = {};
+let sendSuccessChart, ratingChart, costChart;
+
+/* ---------- helpers ---------- */
+function asNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function allNull(arr) {
+  return !arr || arr.length === 0 || arr.every(v => v === null);
+}
+
+function chooseBucket(start, end) {
+  const s = new Date(start);
+  const e = new Date(end);
+  const days = Math.floor((e - s) / (1000 * 60 * 60 * 24)) + 1;
+  if (days <= 45) return 'day';
+  if (days <= 240) return 'week';
+  return 'month';
+}
+
+function rgbaFromRgb(rgb, alpha) {
+  if (typeof rgb !== 'string' || rgb.indexOf('rgb') !== 0) return `rgba(59,130,246,${alpha})`;
+  return rgb.replace('rgb', 'rgba').replace(')', `, ${alpha})`);
+}
+
+/* ---------- sparkline ---------- */
+function drawSparkline(canvasId, values, colorIn) {
+  try {
+    if (sparklineCharts[canvasId]) sparklineCharts[canvasId].destroy();
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+
+    const color = (typeof colorIn === 'string' && colorIn) ? colorIn : 'rgb(59, 130, 246)';
+    const dataVals = (values || []).map(v => asNum(v));
+
+    sparklineCharts[canvasId] = new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: Array(dataVals.length || 1).fill(''),
+        datasets: [{
+          data: dataVals.length ? dataVals : [0],
+          borderColor: color,
+          backgroundColor: rgbaFromRgb(color, 0.1),
+          borderWidth: 2,
+          tension: 0.3,
+          fill: true,
+          pointRadius: 0,
+          pointHoverRadius: 0
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        scales: { x: { display: false }, y: { display: false } },
+        elements: { line: { borderWidth: 2 } }
+      }
+    });
+  } catch (e) {
+    console.error('drawSparkline error', canvasId, e);
+  }
+}
+
+/* ---------- series (7-day mini) ---------- */
+async function loadSparklines() {
+  try {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - 7);
+    const startStr = start.toISOString().split('T')[0];
+    const endStr = end.toISOString().split('T')[0];
+
+    const res = await fetch(`/admin/metrics/series?start=${startStr}&end=${endStr}&bucket=day`);
+    if (!res.ok) return;
+    const payload = await res.json();
+
+    if (payload && payload.send_success && payload.send_success.length) {
+      drawSparkline('kpi-spark-delivery',
+        payload.send_success.map(r => asNum(r.success_rate)),
+        'rgb(59, 130, 246)'
+      );
+    }
+    if (payload && payload.rating && payload.rating.length) {
+      drawSparkline('kpi-spark-relevance',
+        payload.rating.map(r => asNum(r.avg_rating)),
+        'rgb(147, 51, 234)'
+      );
+    }
+  } catch (err) {
+    console.error('loadSparklines error', err);
+  }
+}
+
+/* ---------- series (main charts) ---------- */
+async function loadSeries() {
+  const start = document.getElementById('start-date').value;
+  const end = document.getElementById('end-date').value;
+  const bucket = chooseBucket(start, end);
+  
+  console.log('loadSeries: fetching data...');
+  
+  const res = await fetch(`/admin/metrics/series?start=${start}&end=${end}&bucket=${bucket}`);
+  
+  if (!res.ok) {
+    console.error('loadSeries: response not ok', res.status);
+    return;
+  }
+  
+  const payload = await res.json();
+  const data = payload.results || payload;
+  
+  drawSendSuccess(data.send_success || []);
+  drawRating(data.rating || []);
+  drawCost(data.cost_per_item || []);
+}
+
+function ensureChart(chartRef) {
+  if (chartRef) chartRef.destroy();
+}
+
+function drawSendSuccess(rows) {
+  try {
+    const labels = rows.map(r => r.bucket || r.date || '');
+    const values = rows.map(r => r && r.success_rate != null ? asNum(r.success_rate) : null);
+
+    ensureChart(sendSuccessChart);
+    sendSuccessChart = new Chart(document.getElementById('sendSuccessChart'), {
+      type: 'line',
+      data: {
+        labels: labels.length ? labels : ['No data'],
+        datasets: [{
+          label: 'Send Success %',
+          data: allNull(values) ? [0] : values,
+          borderColor: 'rgb(59, 130, 246)',
+          backgroundColor: 'rgba(59, 130, 246, 0.1)',
+          tension: 0.3,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: true }, tooltip: { mode: 'index', intersect: false } },
+        scales: {
+          y: {
+            suggestedMin: 0,
+            suggestedMax: 100,
+            title: { display: true, text: 'Success Rate (%)' },
+            ticks: { callback: v => Number.isFinite(Number(v)) ? `${Number(v)}%` : v }
+          },
+          x: {
+            title: { display: true, text: 'Date' },
+            ticks: { maxRotation: 45, minRotation: 45 }
+          }
+        }
+      }
+    });
+  } catch (e) {
+    console.error('drawSendSuccess error', e);
+  }
+}
+
+function drawRating(rows) {
+  try {
+    const labels = rows.map(r => r.bucket || r.date || '');
+    const values = rows.map(r => r && r.avg_rating != null ? asNum(r.avg_rating) : null);
+
+    ensureChart(ratingChart);
+    ratingChart = new Chart(document.getElementById('ratingChart'), {
+      type: 'line',
+      data: {
+        labels: labels.length ? labels : ['No data'],
+        datasets: [{
+          label: 'Avg Rating',
+          data: allNull(values) ? [0] : values,
+          borderColor: 'rgb(147, 51, 234)',
+          backgroundColor: 'rgba(147, 51, 234, 0.1)',
+          tension: 0.3,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: true }, tooltip: { mode: 'index', intersect: false } },
+        scales: {
+          y: {
+            suggestedMin: 1,
+            suggestedMax: 5,
+            title: { display: true, text: 'Rating (1-5)' },
+            ticks: { stepSize: 0.5 }
+          },
+          x: {
+            title: { display: true, text: 'Date' },
+            ticks: { maxRotation: 45, minRotation: 45 }
+          }
+        }
+      }
+    });
+  } catch (e) {
+    console.error('drawRating error', e);
+  }
+}
+
+function drawCost(rows) {
+  try {
+    console.log('drawCost: received', rows.length, 'data points', rows);
+    
+    const labels = rows.map(r => r.bucket || '');
+    const values = rows.map(r => {
+      // Explicitly handle null vs 0
+      // null = no data (chart will skip), 0 = valid zero cost
+      if (r && r.cost_per_item != null) {
+        return asNum(r.cost_per_item);
+      }
+      return null; // Use null for gaps, not 0
+    });
+    
+    console.log('drawCost: labels', labels);
+    console.log('drawCost: values', values);
+
+    ensureChart(costChart);
+    costChart = new Chart(document.getElementById('costChart'), {
+      type: 'line',
+      data: {
+        labels: labels.length ? labels : ['No data'],
+        datasets: [{
+          label: '₹ per Delivered Item',
+          data: allNull(values) ? [] : values,
+          borderColor: 'rgb(34, 197, 94)',
+          backgroundColor: 'rgba(34, 197, 94, 0.1)',
+          tension: 0.3,
+          fill: true,
+          spanGaps: true,  // Connect lines across null values
+          pointRadius: 4,
+          pointHoverRadius: 6
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true },
+          tooltip: {
+            mode: 'index',
+            intersect: false,
+            callbacks: {
+              label: function(context) {
+                const y = context.parsed?.y;
+                if (y == null) return 'No deliveries';
+                return '₹' + (Number.isFinite(y) ? y.toFixed(4) : 'N/A');
+              }
+            }
+          }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            title: { display: true, text: 'Cost (₹)' },
+            ticks: {
+              callback: function(value) {
+                const v = Number(value);
+                return '₹' + (Number.isFinite(v) ? v.toFixed(4) : value);
+              }
+            }
+          },
+          x: {
+            title: { display: true, text: 'Date' },
+            ticks: { maxRotation: 45, minRotation: 45 }
+          }
+        }
+      }
+    });
+  } catch (e) {
+    console.error('drawCost error', e);
+  }
+}
+
+/* ---------- KPI cards + vendor table ---------- */
+function renderKPICards(results) {
+  const cards = [];
+
+  if (results.delivery) {
+    const val = results.delivery.send_success_rate != null ? `${results.delivery.send_success_rate}%` : 'N/A';
+    cards.push({
+      id: 'delivery',
+      title: '📧 Delivery Success',
+      value: val,
+      subtitle: `Avg latency: ${results.delivery.avg_latency_ms || 0}ms`
+    });
+  }
+
+  if (results.relevance) {
+    const avgRating = results.relevance.avg_rating;
+    cards.push({
+      id: 'relevance',
+      title: '⭐ Average User Rating',
+      value: avgRating != null && Number.isFinite(Number(avgRating)) ? `${Number(avgRating).toFixed(2)}/5` : 'N/A',
+      subtitle: `${results.relevance.total_feedback || 0} ratings`
+    });
+  }
+
+  // Existing: All fetched articles freshness
+  if (results.freshness) {
+    const avgAge = results.freshness.avg_age_hours;
+    const totalArticles = results.freshness.total_articles || 0;
+    cards.push({
+      id: 'freshness',
+      title: '🕐 Avg Age (All Fetched)',
+      value: avgAge != null && Number.isFinite(Number(avgAge)) ? `${Number(avgAge).toFixed(1)} h` : 'N/A',
+      subtitle: `Total articles: ${totalArticles}`
+    });
+  }
+
+  // NEW: Sent articles freshness with relevance
+  if (results.freshness_sent) {
+    const avgAgeSent = results.freshness_sent.avg_age_hours_sent;
+    const totalSent = results.freshness_sent.total_sent || 0;
+    const avgRelevanceSent = results.freshness_sent.avg_relevance_sent;
+    
+    let subtitle = `${totalSent} sent`;
+    if (avgRelevanceSent != null) {
+      subtitle += ` • Relevance: ${Number(avgRelevanceSent).toFixed(1)}`;
+    }
+    
+    cards.push({
+      id: 'freshness_sent',
+      title: '📧 Avg Age (Sent to Users)',
+      value: avgAgeSent != null && Number.isFinite(Number(avgAgeSent)) ? `${Number(avgAgeSent).toFixed(1)} h` : 'N/A',
+      subtitle: subtitle
+    });
+  }
+
+  // NEW: Total Summaries
+  if (results.summaries) {
+    const totalSummaries = results.summaries.total_summaries || 0;
+    cards.push({
+      id: 'summaries',
+      title: '📝 Total Summaries',
+      value: totalSummaries,
+      subtitle: 'Summaries created'
+    });
+  }
+
+  if (results.coverage) {
+    const coveragePct = results.coverage.coverage_pct || 0;
+    const coveredTickers = results.coverage.covered_tickers || 0;
+    const totalTickers = results.coverage.total_tickers || 0;
+    cards.push({
+      id: 'coverage',
+      title: '📰 Coverage',
+      value: `${Number(coveragePct).toFixed(1)}%`,
+      subtitle: `${coveredTickers}/${totalTickers} tickers covered`
+    });
+  }
+
+  if (results.quality) {
+    const allowPct = results.quality.allowlist_pct;
+    const qualityItems = results.quality.quality_items || 0;
+    const qTotal = results.quality.total_items || 0;
+    cards.push({
+      id: 'quality',
+      title: '✅ Quality Sources',
+      value: allowPct != null ? `${Number(allowPct).toFixed(1)}%` : 'N/A',
+      subtitle: `${qualityItems}/${qTotal} from quality sources`
+    });
+  }
+
+  if (results.mttd) {
+    const avgMins = results.mttd.avg_minutes;
+    const fails = results.mttd.failures || 0;
+    const recovered = results.mttd.recovered || 0;
+    const excluded = results.mttd.excluded || 0;
+    const maxGap = results.mttd.max_gap_minutes || 180;
+    
+    let subtitle = `${recovered}/${fails} incidents recovered`;
+    if (excluded > 0) {
+      subtitle += ` (${excluded} > ${maxGap}m excluded)`;
+    }
+    
+    cards.push({
+      id: 'mttd',
+      title: '🚨 MTTD (Detection Time)',
+      value: avgMins != null ? `${Number(avgMins).toFixed(1)} min` : 'N/A',
+      subtitle: subtitle
+    });
+  }
+
+  // Insert combined Relevance Scores card (overall vs sent) BEFORE MTTR card
+  // Overall relevance: use results.relevance.avg_rating (if available)
+  // Sent relevance: use results.freshness_sent.avg_relevance_sent (if available)
+  // Relevance combined card: show sent relevance (value updated later by loadTickerAges)
+  cards.push({
+    id: 'relevance_combined',
+    title: '🎯 Relevance Scores',
+    value: '—',
+    subtitle: 'Sent: N/A'
+  });
+
+  // NEW: MTTR card (keeps existing placement after relevance)
+  if (results.mttr) {
+    const avgMins = results.mttr.avg_minutes;
+    const minor = results.mttr.minor || 0;
+    const major = results.mttr.major || 0;
+    const unresolved = results.mttr.unresolved || 0;
+    const total = results.mttr.total_incidents || 0;
+    
+    let subtitle = `${minor} minor, ${major} major`;
+    if (unresolved > 0) {
+      subtitle += `, ${unresolved} unresolved`;
+    }
+    
+    cards.push({
+      id: 'mttr',
+      title: '🔧 MTTR (Resolution Time)',
+      value: avgMins != null ? `${Number(avgMins).toFixed(1)} min` : 'N/A',
+      subtitle: subtitle
+    });
+  }
+
+  document.getElementById('kpi-cards').innerHTML = cards.map(card => `
+    <div class="kpi-card">
+      <h3>${card.title}</h3>
+      <div class="value">${card.value}</div>
+      <div class="subtitle">${card.subtitle}</div>
+      <div class="sparkline-container">
+        <canvas id="kpi-spark-${card.id}" height="40"></canvas>
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderVendorTable(vendors) {
+  const tbody = document.getElementById('vendor-table').querySelector('tbody');
+  if (!vendors || !vendors.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:20px;">No vendor data available</td></tr>';
+    return;
+  }
+  
+  const rows = vendors.map(v => {
+    const sr = v && v.success_pct != null ? Number(v.success_pct) : 0;
+    let statusClass = 'status-success';
+    let statusText = 'Healthy';
+    
+    // Special thresholds for Diffbot
+    if (v.provider && v.provider.toLowerCase() === 'diffbot') {
+      if (sr < 50) {
+        statusClass = 'status-error';
+        statusText = 'Critical';
+      } else if (sr < 60) {
+        statusClass = 'status-warning';
+        statusText = 'Warning';
+      } else {
+        statusClass = 'status-success';
+        statusText = 'Healthy';
+      }
+    } else {
+      // Default thresholds for other vendors
+      if (sr < 80) {
+        statusClass = 'status-error';
+        statusText = 'Critical';
+      } else if (sr < 95) {
+        statusClass = 'status-warning';
+        statusText = 'Warning';
+      } else {
+        statusClass = 'status-success';
+        statusText = 'Healthy';
+      }
+    }
+
+    return `
+      <tr>
+        <td><strong>${v.provider}</strong></td>
+        <td>${v.event}</td>
+        <td>${v.total}</td>
+        <td>${Number.isFinite(sr) ? sr.toFixed(1) : 'N/A'}%</td>
+        <td>${v.avg_latency_ms || 0}</td>
+        <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+      </tr>
+    `;
+  }).join('');
+  
+  tbody.innerHTML = rows;
+}
+
+/* ---------- main flow ---------- */
+async function updateDashboard() {
+  const start = document.getElementById('start-date').value;
+  const end = document.getElementById('end-date').value;
+  
+  // Validate date range (max 365 days)
+  const startDate = new Date(start);
+  const endDate = new Date(end);
+  const diffDays = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
+  
+  if (diffDays < 0) {
+    alert("Start date must be before end date.");
+    return;
+  }
+  
+  if (diffDays > 365) {
+    alert("Please select a range within 365 days. Current selection: " + diffDays + " days");
+    return;
+  }
+  
+  // Update URL with validated params
+  const url = new URL(window.location.href);
+  url.searchParams.set('start', start);
+  url.searchParams.set('end', end);
+  window.history.pushState({}, '', url);
+  
+  console.log('updateDashboard: fetching KPIs...');
+  
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const kpiResp = await fetch(
+      `/admin/metrics/kpi?start=${start}&end=${end}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timeoutId);
+    
+    if (!kpiResp.ok) {
+      throw new Error(`KPI request failed: ${kpiResp.status}`);
+    }
+    
+    const kpiData = await kpiResp.json();
+    
+    // Defensive logging for unexpected backend shape
+    console.debug('kpiData raw:', kpiData);
+    // Safely resolve actualResults - handle shapes: { results: { results: ... } } or { results: ... } or direct
+    const actualResults = (kpiData && (kpiData.results?.results ?? kpiData.results ?? kpiData)) || {};
+    
+    renderKPICards(actualResults);
+   console.debug('rendering KPIs with:', actualResults);
+    await loadSeries();
+    
+    const vendors = actualResults.vendor || [];
+    renderVendorTable(vendors);
+
+    // NEW: load ticker avg ages
+    await loadTickerAges();
+
+    console.log('updateDashboard: DONE');
+    
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error('updateDashboard: Request timed out');
+      alert('Dashboard request timed out. Please check the server logs.');
+    } else {
+      console.error('updateDashboard: error:', error);
+      alert('Failed to load dashboard: ' + error.message);
+    }
+  }
+}
+
+function setQuickRange(days) {
+  const end = new Date();
+  const start = new Date();
+  start.setDate(end.getDate() - days);
+  document.getElementById('end-date').value = end.toISOString().split('T')[0];
+  document.getElementById('start-date').value = start.toISOString().split('T')[0];
+  updateDashboard();
+}
+
+document.addEventListener('DOMContentLoaded', updateDashboard);
+
+/* ---------- NEW: Ticker Age table ---------- */
+async function loadTickerAges() {
+  try {
+    const start = document.getElementById('start-date').value;
+    const end = document.getElementById('end-date').value;
+    const resp = await fetch(`/admin/metrics/ticker_age?start=${start}&end=${end}&limit=500`);
+    if (!resp.ok) {
+      console.error('loadTickerAges: failed', resp.status);
+      const tbody = document.querySelector('#ticker-age-table tbody');
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:20px;">Failed to load ticker ages</td></tr>`;
+      // clear summary KPIs
+      renderSummaryKPIs({});
+      return;
+    }
+    const payload = await resp.json();
+    const rows = payload.rows || [];
+    const summary = payload.summary || {};
+    // render summary KPIs (always)
+    renderSummaryKPIs(summary);
+
+    const tbody = document.querySelector('#ticker-age-table tbody');
+
+    if (!rows.length) {
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:20px;">No data for selected range</td></tr>`;
+      _updateSentKPIDisplay(null, 0, null);
+      _updateRelevanceCard(null, 0);
+      return;
+    }
+
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td><strong>${r.ticker || 'N/A'}</strong></td>
+        <td>${r.cnt}</td>
+        <td>${r.avg_hours != null ? Number(r.avg_hours).toFixed(2) : 'N/A'}</td>
+        <td>${r.sent_cnt != null ? r.sent_cnt : 0}</td>
+        <td>${r.avg_hours_sent != null ? Number(r.avg_hours_sent).toFixed(2) : '—'}</td>
+        <td>${r.avg_relevance_sent != null ? Number(r.avg_relevance_sent).toFixed(1) : '—'}</td>
+        <td>${r.user_cnt != null ? r.user_cnt : 0}</td>
+      </tr>
+    `).join('');
+
+    // Compute weighted averages for KPI display
+    const totalSent = rows.reduce((acc, r) => acc + (Number(r.sent_cnt) || 0), 0);
+    
+    const numeratorAge = rows.reduce((acc, r) => {
+      const avgSent = r.avg_hours_sent != null ? Number(r.avg_hours_sent) : 0;
+      const cnt = Number(r.sent_cnt) || 0;
+      return acc + (avgSent * cnt);
+    }, 0);
+    
+    const numeratorRelevance = rows.reduce((acc, r) => {
+      const avgRel = r.avg_relevance_sent != null ? Number(r.avg_relevance_sent) : 0;
+      const cnt = Number(r.sent_cnt) || 0;
+      return acc + (avgRel * cnt);
+    }, 0);
+
+    const weightedAvgAge = totalSent > 0 ? (numeratorAge / totalSent) : null;
+    const weightedAvgRelevance = totalSent > 0 ? (numeratorRelevance / totalSent) : null;
+
+    _updateSentKPIDisplay(weightedAvgAge, totalSent, weightedAvgRelevance);
+    // Update combined relevance card to show sent relevance as main value and total sent as subtitle
+    _updateRelevanceCard(weightedAvgRelevance, totalSent);
+
+  } catch (e) {
+    console.error('loadTickerAges error', e);
+    const tbody = document.querySelector('#ticker-age-table tbody');
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:20px;">Error loading data</td></tr>`;
+    renderSummaryKPIs({});
+    _updateSentKPIDisplay(null, 0, null);
+    _updateRelevanceCard(null, 0);
+  }
+}
+
+// Render summary KPIs above ticker table
+function renderSummaryKPIs(summary) {
+  try {
+    const s = summary || {};
+    const totalUsers = s.total_users != null ? Number(s.total_users) : null;
+    const totalTickersSelected = s.total_tickers_selected != null ? Number(s.total_tickers_selected) : null;
+    const totalUniqueTickers = s.total_unique_tickers_selected != null ? Number(s.total_unique_tickers_selected) : null;
+    const totalEmailsSent = s.total_emails_sent != null ? Number(s.total_emails_sent) : 0;
+    const avgEmailsPerUser = s.avg_emails_sent_per_user != null ? Number(s.avg_emails_sent_per_user) : null;
+    const totalBounced = s.total_bounced != null ? Number(s.total_bounced) : 0;
+    const totalDelivered = s.total_delivered != null ? Number(s.total_delivered) : 0;
+    const totalOpened = s.total_opened != null ? Number(s.total_opened) : 0;
+    const pctOpened = s.pct_opened != null ? Number(s.pct_opened) : null;
+    const avgOpenMinutesRaw = s.avg_open_minutes != null ? Number(s.avg_open_minutes) : null;
+
+    let avgOpenDisplay = 'N/A';
+    if (avgOpenMinutesRaw != null) {
+      if (avgOpenMinutesRaw > 60) {
+        avgOpenDisplay = (avgOpenMinutesRaw / 60).toFixed(2) + ' h';
+      } else {
+        avgOpenDisplay = avgOpenMinutesRaw.toFixed(1) + ' m';
+      }
+    }
+
+    const cards = [
+      { id: 'total_users', title: '👥 Total Users', value: totalUsers != null ? totalUsers : 'N/A', subtitle: '' },
+      { id: 'total_tickers_selected', title: '📌 Total Ticker Selections', value: totalTickersSelected != null ? totalTickersSelected : 'N/A', subtitle: '' },
+      { id: 'total_unique_tickers', title: '🔎 Unique Tickers Selected', value: totalUniqueTickers != null ? totalUniqueTickers : 'N/A', subtitle: '' },
+      { id: 'total_emails_sent', title: '✉️ Total Emails Sent', value: totalEmailsSent, subtitle: avgEmailsPerUser != null ? `Avg / user: ${avgEmailsPerUser}` : '' },
+      { id: 'total_bounced', title: '⚠️ Emails Bounced', value: totalBounced, subtitle: '' },
+      { id: 'total_delivered', title: '✅ Emails Delivered', value: totalDelivered, subtitle: '' },
+      { id: 'total_opened', title: '📬 Emails Opened', value: totalOpened, subtitle: pctOpened != null ? `${pctOpened}% opened` : '' },
+      { id: 'avg_open_time', title: '⏱️ Avg open delay', value: avgOpenDisplay, subtitle: 'Only opens within 12h considered' },
+    ];
+
+    const container = document.getElementById('summary-kpis');
+    if (!container) return;
+    container.innerHTML = cards.map(c => `
+      <div class="kpi-card" id="kpi-${c.id}">
+        <h3>${c.title}</h3>
+        <div class="value">${c.value}</div>
+        <div class="subtitle">${c.subtitle || ''}</div>
+      </div>
+    `).join('');
+  } catch (e) {
+    console.error('renderSummaryKPIs error', e);
+  }
+}
+
+/* ---------- main flow continued ---------- */
+async function loadTickerAges() {
+  try {
+    const start = document.getElementById('start-date').value;
+    const end = document.getElementById('end-date').value;
+    const resp = await fetch(`/admin/metrics/ticker_age?start=${start}&end=${end}&limit=500`);
+    if (!resp.ok) {
+      console.error('loadTickerAges: failed', resp.status);
+      const tbody = document.querySelector('#ticker-age-table tbody');
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:20px;">Failed to load ticker ages</td></tr>`;
+      // clear summary KPIs
+      renderSummaryKPIs({});
+      return;
+    }
+    const payload = await resp.json();
+    const rows = payload.rows || [];
+    const summary = payload.summary || {};
+    // render summary KPIs (always)
+    renderSummaryKPIs(summary);
+
+    const tbody = document.querySelector('#ticker-age-table tbody');
+
+    if (!rows.length) {
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:20px;">No data for selected range</td></tr>`;
+      _updateSentKPIDisplay(null, 0, null);
+      _updateRelevanceCard(null, 0);
+      return;
+    }
+
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td><strong>${r.ticker || 'N/A'}</strong></td>
+        <td>${r.cnt}</td>
+        <td>${r.avg_hours != null ? Number(r.avg_hours).toFixed(2) : 'N/A'}</td>
+        <td>${r.sent_cnt != null ? r.sent_cnt : 0}</td>
+        <td>${r.avg_hours_sent != null ? Number(r.avg_hours_sent).toFixed(2) : '—'}</td>
+        <td>${r.avg_relevance_sent != null ? Number(r.avg_relevance_sent).toFixed(1) : '—'}</td>
+        <td>${r.user_cnt != null ? r.user_cnt : 0}</td>
+      </tr>
+    `).join('');
+
+    // Compute weighted averages for KPI display
+    const totalSent = rows.reduce((acc, r) => acc + (Number(r.sent_cnt) || 0), 0);
+    
+    const numeratorAge = rows.reduce((acc, r) => {
+      const avgSent = r.avg_hours_sent != null ? Number(r.avg_hours_sent) : 0;
+      const cnt = Number(r.sent_cnt) || 0;
+      return acc + (avgSent * cnt);
+    }, 0);
+    
+    const numeratorRelevance = rows.reduce((acc, r) => {
+      const avgRel = r.avg_relevance_sent != null ? Number(r.avg_relevance_sent) : 0;
+      const cnt = Number(r.sent_cnt) || 0;
+      return acc + (avgRel * cnt);
+    }, 0);
+
+    const weightedAvgAge = totalSent > 0 ? (numeratorAge / totalSent) : null;
+    const weightedAvgRelevance = totalSent > 0 ? (numeratorRelevance / totalSent) : null;
+
+    _updateSentKPIDisplay(weightedAvgAge, totalSent, weightedAvgRelevance);
+    // Update combined relevance card to show sent relevance as main value and total sent as subtitle
+    _updateRelevanceCard(weightedAvgRelevance, totalSent);
+
+  } catch (e) {
+    console.error('loadTickerAges error', e);
+    const tbody = document.querySelector('#ticker-age-table tbody');
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:20px;">Error loading data</td></tr>`;
+    renderSummaryKPIs({});
+    _updateSentKPIDisplay(null, 0, null);
+    _updateRelevanceCard(null, 0);
+  }
+}
+
+// Updated helper to include relevance
+function _updateSentKPIDisplay(avgHours, totalSent, avgRelevance) {
+  try {
+    const cards = document.querySelectorAll('#kpi-cards .kpi-card');
+    for (const card of cards) {
+      const titleEl = card.querySelector('h3');
+      if (!titleEl) continue;
+      if (titleEl.textContent && titleEl.textContent.trim().startsWith('📧 Avg Age (Sent to Users)')) {
+        const valueEl = card.querySelector('.value');
+        const subEl = card.querySelector('.subtitle');
+        if (avgHours != null && Number.isFinite(Number(avgHours))) {
+          valueEl.textContent = `${Number(avgHours).toFixed(2)} h`;
+        } else {
+          valueEl.textContent = 'N/A';
+        }
+        
+        let subtitle = `${totalSent || 0} sent`;
+        if (avgRelevance != null && Number.isFinite(Number(avgRelevance))) {
+          subtitle += ` • Relevance: ${Number(avgRelevance).toFixed(1)}`;
+        }
+        subEl.textContent = subtitle;
+        break;
+      }
+    }
+  } catch (e) {
+    console.error('_updateSentKPIDisplay error', e);
+  }
+}
+
+// NEW helper to update combined relevance card
+function _updateRelevanceCard(avgRelSent, totalSent) {
+  try {
+    const cards = document.querySelectorAll('#kpi-cards .kpi-card');
+    for (const card of cards) {
+      const titleEl = card.querySelector('h3');
+      if (!titleEl) continue;
+      if (titleEl.textContent && titleEl.textContent.trim().startsWith('🎯 Relevance Scores')) {
+        const valueEl = card.querySelector('.value');
+        const subEl = card.querySelector('.subtitle');
+        if (avgRelSent != null && Number.isFinite(Number(avgRelSent))) {
+          valueEl.textContent = `${Number(avgRelSent).toFixed(2)}/10`;
+        } else {
+          valueEl.textContent = 'N/A';
+        }
+        subEl.textContent = `${totalSent || 0} sent`;
+        break;
+      }
+    }
+  } catch (e) {
+    console.error('_updateRelevanceCard error', e);
+  }
+}
+</script>
+</body>
+</html>

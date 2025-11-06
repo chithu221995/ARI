@@ -1,10 +1,10 @@
 from __future__ import annotations
 import encodings
 import os
-from typing import List
+from typing import Any, List, Annotated
 import os
 from dotenv import load_dotenv, find_dotenv
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, BeforeValidator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 import re
@@ -19,24 +19,37 @@ load_dotenv(
 # ensure NEWS_TOPK default = 10
 NEWS_TOPK = int(os.getenv("NEWS_TOPK", "10"))
 
+def parse_csv_list(v) -> List[str] | None:
+    """Parse comma-separated string into list."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if x]
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        return parts if parts else None
+    return None
+
 class Settings(BaseSettings):
     # read .env with case-insensitive keys
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=False,
-        extra="ignore",   # ← add this
+        extra="allow",
     )
+    
     # LLM provider selection: "gemini" or "openai"
     LLM_PROVIDER: str = Field("openai", description="gemini|openai")
 
     # Default news sources
-    # Accept either JSON array or comma/space-separated string from env
     NEWS_SOURCES: List[str] = Field(default_factory=lambda: ["google_rss"])
 
     @field_validator("NEWS_SOURCES", mode="before")
     @classmethod
     def _parse_news_sources(cls, v):
-        # None -> default factory will apply
         if v is None:
             return None
         if isinstance(v, (list, tuple)):
@@ -55,23 +68,39 @@ class Settings(BaseSettings):
         parts = [p.strip() for p in re.split(r"[,\s]+", s) if p.strip()]
         return parts or None
 
-    # Optional provider-specific settings (kept here for convenience)
+    # Optional provider-specific settings
     GEMINI_API_KEY: str | None = Field(None)
     GEMINI_MODEL: str = Field("gemini-2.5-pro")
     OPENAI_MODEL: str = Field("gpt-4o-mini")
 
-# module-level settings instance
-
+# Create settings instance
 settings = Settings()
 
-# import logging
-# logging.getLogger("ari.settings").info(
-#     "ari.settings: LLM_PROVIDER=%s NEWS_SOURCES=%s SUMMARY_MAX_TOKENS=%s SUMMARY_TEMPERATURE=%s",
-#     getattr(settings, "LLM_PROVIDER", None),
-#     getattr(settings, "NEWS_SOURCES", None),
-#     getattr(settings, "SUMMARY_MAX_TOKENS", None),
-#     getattr(settings, "SUMMARY_TEMPERATURE", None),
-# )
+# Parse QUALITY_SOURCES manually from env (outside Pydantic)
+QUALITY_SOURCES_ENV = os.getenv("QUALITY_SOURCES", "")
+if QUALITY_SOURCES_ENV:
+    QUALITY_SOURCES = [s.strip() for s in QUALITY_SOURCES_ENV.split(",") if s.strip()]
+else:
+    QUALITY_SOURCES = [
+        "reuters.com",
+        "wsj.com",
+        "bloomberg.com",
+        "economictimes.indiatimes.com",
+        "moneycontrol.com",
+        "livemint.com",
+        "thehindubusinessline.com",
+        "bqprime.com",
+        "ndtvprofit.com",
+        "business-standard.com",
+        "financialexpress.com"
+    ]
+
+# MTTD Configuration
+MTTD_MAX_GAP_MINUTES_ENV = os.getenv("MTTD_MAX_GAP_MINUTES", "180")
+try:
+    MTTD_MAX_GAP_MINUTES = int(MTTD_MAX_GAP_MINUTES_ENV)
+except ValueError:
+    MTTD_MAX_GAP_MINUTES = 180
 
 # Back-compat: expose validated NEWS_SOURCES at module level for callers importing the module
 NEWS_SOURCES = settings.NEWS_SOURCES
@@ -175,6 +204,8 @@ def as_dict() -> dict:
         "NEWS_TIMEOUT_S": NEWS_TIMEOUT_S,
         "DEBUG_NEWS_LOG": DEBUG_NEWS_LOG,
         "NEWS_SOURCES": settings.NEWS_SOURCES,
+        "QUALITY_SOURCES": QUALITY_SOURCES,  # ✅ Use module-level variable, not settings.QUALITY_SOURCES
+        "MTTD_MAX_GAP_MINUTES": MTTD_MAX_GAP_MINUTES,  # ADD THIS LINE
         "NEWS_LANGUAGE": NEWS_LANGUAGE,
         "ALLOWLIST_DOMAINS": ALLOWLIST_DOMAINS,
         "BLOCKLIST_DOMAINS": BLOCKLIST_DOMAINS,

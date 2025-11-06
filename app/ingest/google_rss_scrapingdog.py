@@ -2,31 +2,39 @@ from __future__ import annotations
 
 import logging
 import httpx
+import time
+import asyncio
 from typing import List, Dict, Any
 
 from app.core import settings
+from app.core.metrics import record_vendor_event
+from app.core.retry_utils import rate_limited_retry  # ADD THIS
 
 log = logging.getLogger("ari.ingest.google_rss_scrapingdog")
 
+@rate_limited_retry(
+    provider="scrapingdog",
+    max_retries=2,
+    base_delay=2.0,
+    max_per_minute=5
+)
 async def search_google_news_scrapingdog(
     query: str,
     aliases: list[str],
     topk: int = 10,
     country: str = "us",
-    timeout_s: int = 8,
+    timeout_s: int = 15,
+    max_retries: int = 1,  # Keep parameter for backward compatibility
 ) -> List[Dict[str, Any]]:
     """
-    Adapter for ScrapingDog Google News.
-    Args:
-      query: primary search term
-      aliases: optional list of alias terms to include
-      topk: maximum results to return (and passed to the API as `results`)
-      country: country code (default "in")
-      timeout_s: HTTP client timeout in seconds
-    Returns list of dicts with keys: title, url, source, published_hint, snippet
+    Adapter for ScrapingDog Google News with automatic retries and rate limiting.
+    
+    The @rate_limited_retry decorator handles:
+    - Rate limiting (5 calls/minute)
+    - Exponential backoff on failures
+    - Automatic retries on network errors
     """
     q_terms = [query] + [a for a in (aliases or []) if a]
-    # quote multi-word terms for safer queries
     q = " OR ".join([f'"{t}"' if " " in t else t for t in q_terms]) if q_terms else query
 
     params = {
@@ -38,13 +46,18 @@ async def search_google_news_scrapingdog(
 
     url = "https://api.scrapingdog.com/google_news"
     out: list[dict] = []
+    start_time = time.time()
+    success = False
 
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
+            log.info(f"scrapingdog: fetching for query={q}")
+            
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json() or {}
             items = data if isinstance(data, list) else data.get("news_results") or []
+            
             for it in items:
                 obj = {
                     "title": it.get("title") or "",
@@ -56,8 +69,22 @@ async def search_google_news_scrapingdog(
                 out.append(obj)
                 if len(out) >= int(topk or 0):
                     break
-    except Exception:
-        log.exception("scrapingdog: fetch failed for query=%s", q)
+            
+            success = True
+    
+    finally:
+        latency_ms = int((time.time() - start_time) * 1000)
+        
+        record_vendor_event(
+            provider="scrapingdog",
+            event="fetch",
+            ok=success,
+            latency_ms=latency_ms
+        )
+        
+        if success:
+            log.info(f"scrapingdog: query={q} requested={int(topk or 0)} kept={len(out)} latency={latency_ms}ms")
+        else:
+            log.warning(f"scrapingdog: query={q} failed, returning empty list")
 
-    log.info("scrapingdog: query=%s requested=%d kept=%d", q, int(topk or 0), len(out))
     return out

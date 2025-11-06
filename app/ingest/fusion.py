@@ -1,13 +1,17 @@
 from __future__ import annotations
 import logging
+import json
+import sqlite3
 import time
-from typing import List, Dict, Set, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Set, Optional
 from datetime import datetime
 
 from app.core import settings
+from app.core.cache import CACHE_DB_PATH
 from app.core.metrics import record_metric
 from app.ingest.adapters import newsapi, google_rss
 from app.ingest.adapters.base import NewsItem, domain_from_url
+from app.ingest.google_rss_scrapingdog import search_google_news_scrapingdog
 
 log = logging.getLogger("ari.fusion")
 # module import-time log of configured news sources (short, non-secret)
@@ -45,6 +49,136 @@ def _parse_published_at(v: Optional[str]) -> float:
             return dt.timestamp()
         except Exception:
             return 0.0
+
+
+def build_search_terms_for_ticker(ticker: str) -> Tuple[str, List[str]]:
+    """
+    Returns (primary_query, aliases_list) for a ticker.
+    - primary_query = company_name (never the symbol)
+    - aliases_list = aliases_json (include the symbol only if it is explicitly in that list)
+
+    Args:
+        ticker: Ticker symbol to look up
+
+    Returns:
+        Tuple of (company_name, list of aliases)
+    """
+    try:
+        with sqlite3.connect(CACHE_DB_PATH, timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT company_name, aliases_json FROM ticker_catalog WHERE ticker = ? LIMIT 1",
+                (ticker,),
+            ).fetchone()
+
+            if not row:
+                log.warning("build_search_terms: ticker=%s not found in catalog, using symbol", ticker)
+                return ticker, []
+
+            company = (row["company_name"] or "").strip()
+            if not company:
+                log.warning("build_search_terms: ticker=%s has no company_name, using symbol", ticker)
+                company = ticker
+
+            # Parse aliases from JSON
+            aliases = []
+            try:
+                aliases_json = row["aliases_json"] or "[]"
+                aliases = json.loads(aliases_json)
+            except (json.JSONDecodeError, TypeError) as e:
+                log.warning("build_search_terms: ticker=%s aliases_json parse failed: %s", ticker, e)
+                aliases = []
+
+            # Sanitize and dedupe aliases
+            aliases = [a.strip() for a in aliases if a and isinstance(a, str) and a.strip()]
+            aliases = list(dict.fromkeys(aliases))  # Remove duplicates while preserving order
+
+            log.debug(
+                "build_search_terms: ticker=%s company='%s' aliases=%s",
+                ticker,
+                company,
+                aliases,
+            )
+
+            return company, aliases
+
+    except Exception as e:
+        log.exception("build_search_terms: failed for ticker=%s", ticker)
+        return ticker, []
+
+
+async def fetch_news_for_ticker(
+    ticker: str,
+    max_items: int = 10,
+    days: int = 7,
+    country: str = "in",
+) -> List[Dict[str, Any]]:
+    """
+    Fetch news for a specific ticker using company name and aliases from catalog.
+
+    Args:
+        ticker: Ticker symbol
+        max_items: Maximum number of results to return
+        days: Not used (kept for compatibility)
+        country: Country code for news search
+
+    Returns:
+        List of news items with title, url, source, published_hint, snippet
+    """
+    # Build search terms from ticker catalog
+    company, aliases = build_search_terms_for_ticker(ticker)
+
+    # Debug log before calling adapter
+    log.debug(
+        "news.search",
+        extra={
+            "ticker": ticker,
+            "company": company,
+            "aliases": aliases,
+            "max_items": max_items,
+            "country": country,
+        },
+    )
+
+    log.info(
+        "fetch_news_for_ticker: ticker=%s company='%s' aliases=%s topk=%d",
+        ticker,
+        company,
+        aliases,
+        max_items,
+    )
+
+    try:
+        # Call ScrapingDog adapter with company name as primary query
+        results = await search_google_news_scrapingdog(
+            query=company,
+            aliases=aliases,
+            topk=max_items,
+            country=country,
+            timeout_s=8,
+        )
+
+        # Add ticker to each result for downstream processing
+        for item in results:
+            item["ticker"] = ticker
+
+        log.info(
+            "fetch_news_for_ticker: ticker=%s company='%s' fetched=%d",
+            ticker,
+            company,
+            len(results),
+        )
+
+        return results
+
+    except Exception as e:
+        log.exception(
+            "fetch_news_for_ticker: failed for ticker=%s company='%s'",
+            ticker,
+            company,
+        )
+        return []
 
 
 async def fetch_fused_news(ticker: str, top_k: int = 10, days: int = 7) -> list[dict]:

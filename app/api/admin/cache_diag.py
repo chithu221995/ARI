@@ -6,9 +6,10 @@ from app.ingest.extract import extract_via_diffbot
 
 # new imports for DB init
 from app.core.cache import ensure_phase4_user_catalog_schemas, CACHE_DB_PATH, load_ticker_catalog_from_file
+from app.cache.db_init import init_all_tables
 
-log = logging.getLogger("ari.admin.cache_diag")
-router = APIRouter(prefix="/metrics", tags=["admin:metrics"])
+log = logging.getLogger("ari.admin.cache")
+router = APIRouter(tags=["admin:cache"])
 
 
 @router.get("/ping-extract")
@@ -28,15 +29,85 @@ async def ping_extract(url: str = Query(..., description="URL to probe with Diff
 @router.post("/db/init")
 async def db_init():
     """
-    Ensure phase4 user/catalog schemas are present in the cache DB.
+    Initialize all DB schemas including feedback tables.
     """
+    import aiosqlite
+
     try:
-        await ensure_phase4_user_catalog_schemas(CACHE_DB_PATH)
-        log.info("/db/init: phase4 schemas ensured at %s", CACHE_DB_PATH)
+        # Initialize all tables including new feedback tables
+        await init_all_tables()
+
+        # Keep existing schema initialization for backward compatibility
+        async with aiosqlite.connect(CACHE_DB_PATH) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS articles (
+                    url_hash TEXT PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    url TEXT NOT NULL UNIQUE,
+                    title TEXT,
+                    content TEXT,
+                    lang TEXT,
+                    published_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS summaries (
+                    url_hash TEXT PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    summary TEXT,
+                    sentiment TEXT,
+                    relevance INTEGER,
+                    why_it_matters TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job TEXT NOT NULL,
+                    ticker TEXT,
+                    ok INTEGER NOT NULL,
+                    note TEXT,
+                    started_at TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    to_email TEXT NOT NULL,
+                    subject TEXT,
+                    sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    items_count INTEGER,
+                    provider TEXT,
+                    ok INTEGER NOT NULL,
+                    error TEXT
+                )
+                """
+            )
+
+            # Create indexes
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_articles_ticker ON articles(ticker)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_summaries_ticker ON summaries(ticker)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_runs_job_ticker ON runs(job, ticker)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_email_logs_to_sent ON email_logs(to_email, sent_at)")
+
+            await db.commit()
+
+        log.info("db_init: all schemas initialized successfully")
         return {"ok": True, "db": CACHE_DB_PATH}
-    except Exception:
-        log.exception("/db/init: failed")
-        raise HTTPException(status_code=500, detail="init_failed")
+
+    except Exception as e:
+        log.exception("db_init: failed")
+        return {"ok": False, "error": str(e)}
 
 
 @router.post("/catalog/reload")

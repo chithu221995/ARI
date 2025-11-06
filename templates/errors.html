@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARI - Recent Errors</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .header h1 {
+            font-size: 32px;
+            color: #2d3748;
+            margin-bottom: 10px;
+        }
+        
+        .header-links {
+            float: right;
+            margin-top: -40px;
+        }
+        
+        .header-links a {
+            color: #667eea;
+            text-decoration: none;
+            margin-left: 20px;
+            font-weight: 500;
+            transition: color 0.3s;
+        }
+        
+        .header-links a:hover {
+            color: #764ba2;
+        }
+        
+        .refresh-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            transition: background 0.3s;
+            margin-bottom: 20px;
+        }
+        
+        .refresh-btn:hover {
+            background: #764ba2;
+        }
+        
+        .error-message {
+            background: #fed7d7;
+            color: #c53030;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #c53030;
+        }
+        
+        .table-container {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            overflow-x: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        thead {
+            background: #f7fafc;
+        }
+        
+        th {
+            padding: 16px;
+            text-align: left;
+            font-weight: 600;
+            color: #4a5568;
+            border-bottom: 2px solid #e2e8f0;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        td {
+            padding: 16px;
+            border-bottom: 1px solid #e2e8f0;
+            color: #2d3748;
+        }
+        
+        tbody tr:hover {
+            background: #f7fafc;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .badge-gemini {
+            background: #faf5ff;
+            color: #6b46c1;
+        }
+        
+        .badge-diffbot {
+            background: #fffaf0;
+            color: #c05621;
+        }
+        
+        .badge-openai {
+            background: #f0fff4;
+            color: #22543d;
+        }
+        
+        .badge-scrapingdog {
+            background: #ebf8ff;
+            color: #2c5282;
+        }
+        
+        .badge-default {
+            background: #edf2f7;
+            color: #4a5568;
+        }
+        
+        .badge-resolved {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+        
+        .badge-unresolved {
+            background: #fed7d7;
+            color: #c53030;
+        }
+        
+        .timestamp {
+            font-size: 13px;
+            color: #718096;
+        }
+        
+        .message-cell {
+            max-width: 400px;
+            word-wrap: break-word;
+            font-size: 13px;
+        }
+        
+        .no-errors {
+            text-align: center;
+            padding: 60px 20px;
+            color: #718096;
+        }
+        
+        .no-errors h2 {
+            font-size: 24px;
+            margin-bottom: 10px;
+        }
+        
+        .status-cell {
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚨 Recent Errors</h1>
+            <div class="header-links">
+                <a href="/dashboard/metrics">← Back to Dashboard</a>
+            </div>
+        </div>
+        
+        <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+        
+        {% if error_message %}
+        <div class="error-message">
+            <strong>Error:</strong> {{ error_message }}
+        </div>
+        {% endif %}
+        
+        {% if debug_info %}
+        <div style="background: #e6fffa; color: #234e52; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 13px;">
+            <strong>Debug:</strong> {{ debug_info }}
+        </div>
+        {% endif %}
+        
+        {% if errors %}
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Provider</th>
+                        <th>Event</th>
+                        <th>Job Type</th>
+                        <th>Message</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for e in errors %}
+                    <tr>
+                        <td class="timestamp">{{ e.created_at }}</td>
+                        <td>
+                            {% if e.provider.lower() == 'gemini' %}
+                                <span class="badge badge-gemini">{{ e.provider }}</span>
+                            {% elif e.provider.lower() == 'diffbot' %}
+                                <span class="badge badge-diffbot">{{ e.provider }}</span>
+                            {% elif e.provider.lower() == 'openai' %}
+                                <span class="badge badge-openai">{{ e.provider }}</span>
+                            {% elif e.provider.lower() == 'scrapingdog' %}
+                                <span class="badge badge-scrapingdog">{{ e.provider }}</span>
+                            {% else %}
+                                <span class="badge badge-default">{{ e.provider }}</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ e.event }}</td>
+                        <td>{{ e.job_type }}</td>
+                        <td class="message-cell">{{ e.message }}</td>
+                        <td class="status-cell">
+                            {% if e.is_resolved %}
+                                <span class="badge badge-resolved">✓ Resolved</span>
+                                <div class="timestamp">{{ e.resolved_by }}</div>
+                            {% else %}
+                                <span class="badge badge-unresolved">⚠ Open</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="table-container">
+            <div class="no-errors">
+                <h2>✨ No Errors Found</h2>
+                <p>All systems are running smoothly!</p>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>

@@ -3,43 +3,24 @@ import sys
 import logging
 from contextlib import asynccontextmanager
 
+import aiosqlite
+
 # Configure logging early to ensure all logs are captured
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
 logging.getLogger().handlers[0].flush = sys.stdout.flush  # ensure flush after each write
 
-import aiosqlite
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
 from app.core.settings import settings
-from app.api import router as api_router
-from app.api.admin import jobs as jobs_admin
-
-# create the FastAPI app before mounting routers
-app = FastAPI(title="A.R.I. Engine")
-app.include_router(api_router)
-# app.include_router(admin_pkg)
-
-# v1 routers
-# from app.api.v1 import brief as v1_brief
-# from app.api.v1 import summary as v1_summary
-
-# mount v1 routers
-# app.include_router(v1_brief.router)        # /api/v1/brief
-app.include_router(api_router)      # /api/v1/summarize (GET+POST)
-
-# debug API
-from app.api import debug as debug_api
-# include debug router once under /debug (guard checks healthz specifically)
-if not any(getattr(r, "path", "") == "/debug/healthz" for r in app.router.routes):
-    app.include_router(debug_api.router, prefix="/debug")
-
-# UI router
-from app.api import ui as ui_routes
-
-# Include UI router (place after other includes to avoid duplication)
-if not any(getattr(r, "path", "") == "/" for r in app.router.routes if hasattr(r, "path")):
-    app.include_router(ui_routes.router)
+# Import admin routers
+from app.api.admin import jobs as admin_jobs
+from app.api.admin import metrics as admin_metrics
+from app.api.admin import email as admin_email
+from app.api.admin import retry_stats as admin_retry_stats
+from app.routes import dashboard_metrics
+from app.api.admin.cache import router as cache_router
+from app.api.admin.errors import router as errors_router
 
 # database initialization helpers (kept)
 import os
@@ -98,14 +79,6 @@ async def purge_expired(ttl_days: int = 7) -> int:
         log.error("purge_expired failed: %s", e)
     return deleted
 
-# keep /debug router if present (already included above)
-try:
-    from app.api.debug import router as debug_router  # type: ignore
-    if not any(getattr(r, "path", "").startswith("/debug") for r in app.router.routes):
-        app.include_router(debug_router, prefix="/debug")
-except Exception:
-    pass
-
 # make sure these are exported
 __all__ = [
     "count_articles_rows",
@@ -149,7 +122,87 @@ if os.getenv("RUN_SCHEDULER", "0") in {"1", "true", "yes"}:
             with suppress(Exception):
                 await run_daily_fanout()
 
-    @app.on_event("startup")
-    async def _start_scheduler():
+from app.db.migrations.add_run_errors import migrate_add_run_errors
+from app.db.migrations.add_news_age_column import migrate_add_news_age_column
+from app.db.migrations.link_summaries_to_articles import migrate_link_summaries_to_articles
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    log.info("Application startup")
+    
+    # Run migrations
+    try:
+        db_path = os.getenv("SQLITE_PATH", "./ari.db")
+        await migrate_add_run_errors(db_path)
+        await migrate_add_news_age_column(db_path)
+        await migrate_link_summaries_to_articles(db_path)  # NEW
+        log.info("Migrations completed successfully")
+    except Exception as e:
+        log.error(f"Migration failed: {e}")
+    
+    # Start scheduler if enabled
+    if os.getenv("RUN_SCHEDULER", "0") in {"1", "true", "yes"}:
         asyncio.create_task(scheduler_loop())
         log.info("scheduler: started")
+    
+    yield
+    # Shutdown
+    log.info("Application shutdown")
+
+# Create FastAPI app
+app = FastAPI(
+    title="ARI API",
+    description="Asset Relevance Intelligence API",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# ============================================================================
+# CANONICAL ADMIN ROUTES (included in OpenAPI schema)
+# ============================================================================
+app.include_router(admin_jobs.router, prefix="/admin/jobs", tags=["Admin"])
+app.include_router(admin_metrics.router, prefix="/admin/metrics", tags=["Admin"])
+app.include_router(admin_email.router, prefix="/admin/email", tags=["Admin"])
+app.include_router(admin_retry_stats.router, prefix="/admin/retry", tags=["Admin"])
+app.include_router(cache_router, prefix="/admin/cache", tags=["Cache"])
+app.include_router(errors_router, prefix="/admin", tags=["Admin"])
+
+# Register dashboard routes
+app.include_router(dashboard_metrics.router)
+
+# ============================================================================
+# PUBLIC ALIASES (not included in schema to avoid duplicates)
+# ============================================================================
+# Optional: provide backward-compatible /jobs/* endpoints without schema duplication
+app.include_router(admin_jobs.router, prefix="/jobs", include_in_schema=False)
+
+# ============================================================================
+# DEBUG & UI ROUTES
+# ============================================================================
+from app.api import debug as debug_api
+app.include_router(debug_api.router, prefix="/debug", tags=["debug"])
+
+from app.api import ui as ui_routes
+app.include_router(ui_routes.router, tags=["ui"])
+
+# ============================================================================
+# ROOT REDIRECT
+# ============================================================================
+@app.get("/")
+def root():
+    """Root endpoint - redirects to docs"""
+    return RedirectResponse(url="/docs")
+
+@app.get("/debug/routes")
+async def list_routes():
+    """Debug endpoint to list all registered routes"""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, "path"):
+            routes.append({
+                "path": route.path,
+                "name": route.name,
+                "methods": list(route.methods) if hasattr(route, "methods") else []
+            })
+    return {"routes": routes}

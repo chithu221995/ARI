@@ -82,6 +82,64 @@ def record_metric(event: str, provider: str, latency_ms: int, ok: bool) -> None:
         log.exception("metrics: json record failed")
 
 
+def record_vendor_event(provider: str, event: str, ok: bool, latency_ms: int) -> None:
+    """
+    Record a vendor API call to the vendor_metrics table.
+
+    Args:
+        provider: Vendor name (e.g., "scrapingdog", "diffbot", "sendgrid")
+        event: Event type (e.g., "google_news", "extract_article", "send_email")
+        ok: Whether the call succeeded
+        latency_ms: Latency in milliseconds
+    """
+    ts = _utc_now_iso()
+    ok_int = 1 if ok else 0
+    cache_db = _resolve_cache_db_path()
+
+    log.debug(f"record_vendor_event: provider={provider} event={event} ok={ok} latency_ms={latency_ms} db={cache_db}")
+
+    try:
+        if os.path.exists(cache_db):
+            conn = sqlite3.connect(cache_db, timeout=5)
+            try:
+                cur = conn.cursor()
+                # Create table if not exists
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS vendor_metrics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        provider TEXT NOT NULL,
+                        event TEXT NOT NULL,
+                        ok INTEGER NOT NULL,
+                        latency_ms INTEGER,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                # Insert the record
+                cur.execute(
+                    """
+                    INSERT INTO vendor_metrics (provider, event, ok, latency_ms, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (provider, event, ok_int, int(latency_ms or 0), ts),
+                )
+                conn.commit()
+
+                # Verify insert worked
+                cur.execute("SELECT COUNT(*) FROM vendor_metrics WHERE provider = ? AND event = ?", (provider, event))
+                count = cur.fetchone()[0]
+                log.info(
+                    f"metrics: recorded vendor_metrics provider={provider} event={event} ok={ok} latency_ms={latency_ms} (total_count={count})"
+                )
+            finally:
+                conn.close()
+        else:
+            log.error(f"record_vendor_event: cache_db does not exist at {cache_db}")
+    except Exception as e:
+        log.exception(f"metrics: vendor_metrics record failed for provider={provider} event={event}: {e}")
+
+
 def get_daily_summary() -> List[Dict[str, Any]]:
     """
     Return totals per event/provider for today (UTC).

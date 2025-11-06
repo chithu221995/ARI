@@ -26,34 +26,44 @@ async def run_daily_fanout(max_items_per_ticker: int = 5) -> Dict[str, Any]:
 
     # 2) Per-ticker pipeline (deduped)
     did = {"fetch": 0, "extract": 0, "summarize": 0, "emails": 0}
+
     for t in tickers:
+        # Step 1: Fetch news articles from ScrapingDog
         try:
             await job_fetch(ticker=t, max_items=getattr(settings, "NEWS_TOPK", 10))
             did["fetch"] += 1
-        except Exception:
-            log.exception("fanout: fetch failed ticker=%s", t)
+            log.info(f"fanout: fetch completed for ticker={t}")
+        except Exception as e:
+            log.exception("fanout: fetch failed ticker=%s error=%s", t, e)
 
+        # Step 2: Extract content using Diffbot ✅ THIS WAS MISSING!
         try:
             await job_extract(ticker=t)
             did["extract"] += 1
-        except Exception:
-            log.exception("fanout: extract failed ticker=%s", t)
+            log.info(f"fanout: extract completed for ticker={t}")
+        except Exception as e:
+            log.exception("fanout: extract failed ticker=%s error=%s", t, e)
 
+        # Step 3: Summarize with LLM
         try:
             await job_summarize(tickers=[t])
             did["summarize"] += 1
-        except Exception:
-            log.exception("fanout: summarize failed ticker=%s", t)
+            log.info(f"fanout: summarize completed for ticker={t}")
+        except Exception as e:
+            log.exception("fanout: summarize failed ticker=%s error=%s", t, e)
 
     # 3) Fan-out emails (read per user tickers and send one email each)
     user_map = get_user_tickers_map(CACHE_DB_PATH)
+    log.info(f"fanout: sending emails to {len(user_map)} users")
+
     for email, user_tickers in user_map.items():
         try:
             # send_brief_email already knows how to assemble summaries by ticker
             ok = await send_brief_email(email=email, tickers=user_tickers)
             did["emails"] += 1 if ok else 0
-        except Exception:
-            log.exception("fanout: email failed email=%s", email)
+            log.info(f"fanout: email sent to {email} ok={ok}")
+        except Exception as e:
+            log.exception("fanout: email failed email=%s error=%s", email, e)
 
     log.info("fanout: done %s", did)
     return {"ok": True, "tickers": tickers, **did}

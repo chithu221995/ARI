@@ -151,3 +151,150 @@ def insert_run(
             (job, ticker, started_at, ended_at, ok, note[:500]),
         )
         con.commit()
+
+
+def insert_email_log(
+    email: str,
+    subject: str,
+    items_count: int,
+    provider: str,
+    ok: bool,
+    error: str | None,
+    provider_message_id: str | None = None
+) -> int | None:
+    """
+    Insert an email_logs entry and return the ID.
+    
+    Returns:
+        int: The ID of the inserted row, or None on failure
+    """
+    from app.core.cache import CACHE_DB_PATH
+    import sqlite3
+    
+    try:
+        with sqlite3.connect(CACHE_DB_PATH, timeout=5) as conn:
+            cur = conn.cursor()
+            
+            # Use correct column names: to_email, ok (not email_to, status)
+            cur.execute(
+                """
+                INSERT INTO email_logs 
+                (to_email, subject, items_count, provider, ok, error, provider_message_id, sent_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (email, subject, items_count, provider, 1 if ok else 0, error, provider_message_id)
+            )
+            log_id = cur.lastrowid
+            conn.commit()
+            log.info(f"email_logs: inserted log_id={log_id} to_email={email}")
+            return log_id
+            
+    except Exception as e:
+        log.error(f"Failed to insert email_log: {e}")
+        return None
+
+
+def get_articles_needing_extraction(
+    ticker: str, 
+    limit: int = 10, 
+    force: bool = False
+) -> list[dict]:
+    """
+    Get articles that need content extraction (content is NULL or empty).
+    
+    Args:
+        ticker: Stock ticker symbol
+        limit: Maximum number of articles to return
+        force: If True, re-extract even if content exists
+    
+    Returns:
+        List of article dicts with url, title, ticker
+    """
+    from app.core.cache import CACHE_DB_PATH
+    import sqlite3
+    
+    log.info(f"get_articles_needing_extraction: ticker={ticker} limit={limit} force={force}")
+    
+    try:
+        with sqlite3.connect(CACHE_DB_PATH, timeout=5) as conn:
+            cur = conn.cursor()
+            
+            if force:
+                # Re-extract all recent articles
+                query = """
+                    SELECT url, title, ticker
+                    FROM articles
+                    WHERE ticker = ?
+                    ORDER BY published_at DESC
+                    LIMIT ?
+                """
+                cur.execute(query, (ticker, limit))
+            else:
+                # Only extract articles without content
+                query = """
+                    SELECT url, title, ticker
+                    FROM articles
+                    WHERE ticker = ?
+                      AND (content IS NULL OR content = '' OR LENGTH(content) < 100)
+                    ORDER BY published_at DESC
+                    LIMIT ?
+                """
+                cur.execute(query, (ticker, limit))
+            
+            rows = cur.fetchall()
+            articles = []
+            for row in rows:
+                articles.append({
+                    "url": row[0],
+                    "title": row[1],
+                    "ticker": row[2]
+                })
+            
+            log.info(f"get_articles_needing_extraction: found {len(articles)} articles for ticker={ticker}")
+            return articles
+            
+    except Exception as e:
+        log.error(f"get_articles_needing_extraction: error for ticker={ticker}: {e}", exc_info=True)
+        return []
+
+
+def update_article_content(url: str, content: str) -> bool:
+    """
+    Update the content field for an article in articles table.
+    
+    Args:
+        url: Article URL (unique identifier)
+        content: Extracted article content
+    
+    Returns:
+        bool: True if update succeeded, False otherwise
+    """
+    from app.core.cache import CACHE_DB_PATH
+    import sqlite3
+    
+    try:
+        with sqlite3.connect(CACHE_DB_PATH, timeout=5) as conn:
+            cur = conn.cursor()
+            
+            cur.execute(
+                """
+                UPDATE articles
+                SET content = ?
+                WHERE url = ?
+                """,
+                (content, url)
+            )
+            
+            rows_affected = cur.rowcount
+            conn.commit()
+            
+            if rows_affected > 0:
+                log.info(f"update_article_content: updated content for url={url} ({len(content)} chars)")
+                return True
+            else:
+                log.warning(f"update_article_content: no article found with url={url}")
+                return False
+            
+    except Exception as e:
+        log.error(f"update_article_content: error updating url={url}: {e}", exc_info=True)
+        return False
