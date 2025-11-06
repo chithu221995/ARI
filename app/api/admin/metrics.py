@@ -339,92 +339,89 @@ async def ticker_age(
 
         # --- Summary metrics for dashboard (totals / rates) ---
         try:
-            # total users
+            # Total users
             cur.execute("SELECT COUNT(*) FROM users")
             total_users = int((cur.fetchone() or [0])[0] or 0)
 
-            # total tickers selected (user_tickers rows) and unique tickers
+            # Total tickers selected (user_tickers rows) and unique tickers
             cur.execute("SELECT COUNT(*) FROM user_tickers")
             total_tickers_selected = int((cur.fetchone() or [0])[0] or 0)
             cur.execute("SELECT COUNT(DISTINCT UPPER(TRIM(ticker))) FROM user_tickers")
             total_unique_tickers_selected = int((cur.fetchone() or [0])[0] or 0)
 
-            # --- Emails: use DISTINCT message identity (email + item_url_hash + date) from email_events ---
-            # total delivered events (rows)
-            cur.execute(
-                "SELECT COUNT(*) FROM email_events WHERE event_type = 'delivered' AND created_at BETWEEN ? AND ?",
-                (start_iso, end_iso)
-            )
-            delivered_events = int((cur.fetchone() or [0])[0] or 0)
-
-            # total bounced/dropped events (rows)
-            cur.execute(
-                "SELECT COUNT(*) FROM email_events WHERE event_type IN ('dropped','bounced') AND created_at BETWEEN ? AND ?",
-                (start_iso, end_iso)
-            )
-            bounced_events = int((cur.fetchone() or [0])[0] or 0)
-
-            # total open events (rows)
-            cur.execute(
-                "SELECT COUNT(*) FROM email_events WHERE event_type = 'open' AND created_at BETWEEN ? AND ?",
-                (start_iso, end_iso)
-            )
-            open_events = int((cur.fetchone() or [0])[0] or 0)
-
-            # Count DISTINCT messages (email + item_url_hash + date(created_at)) for delivered / open
+            # --- Emails: use email_logs as source of truth for sent emails ---
+            # Total emails sent (from email_logs where ok=1)
             cur.execute(
                 """
-                SELECT 
-                  COUNT(DISTINCT (email || '||' || COALESCE(item_url_hash,'') || '||' || date(created_at))) as delivered_distinct
-                FROM email_events
-                WHERE event_type = 'delivered' AND created_at BETWEEN ? AND ?
+                SELECT COUNT(*) 
+                FROM email_logs 
+                WHERE ok = 1 
+                  AND sent_at BETWEEN ? AND ?
                 """,
                 (start_iso, end_iso)
             )
-            delivered_distinct = int((cur.fetchone() or [0])[0] or 0)
+            total_emails_sent = int((cur.fetchone() or [0])[0] or 0)
 
+            # Average emails per user
+            avg_emails_per_user = round((total_emails_sent / total_users), 2) if total_users > 0 else 0.0
+
+            # --- Email engagement from email_events (SendGrid webhooks) ---
+            # Count distinct delivered events (unique email + date combinations)
             cur.execute(
                 """
-                SELECT 
-                  COUNT(DISTINCT (email || '||' || COALESCE(item_url_hash,'') || '||' || date(created_at))) as open_distinct
+                SELECT COUNT(DISTINCT (email || '||' || date(created_at)))
                 FROM email_events
-                WHERE event_type = 'open' AND created_at BETWEEN ? AND ?
+                WHERE event_type = 'delivered' 
+                  AND created_at BETWEEN ? AND ?
                 """,
                 (start_iso, end_iso)
             )
-            open_distinct = int((cur.fetchone() or [0])[0] or 0)
+            total_delivered = int((cur.fetchone() or [0])[0] or 0)
 
-            # If email_events has no deliveries, fallback to email_items (count distinct recipients / items)
-            if delivered_distinct == 0:
-                cur.execute(
-                    "SELECT COUNT(*) FROM email_items WHERE sent_at BETWEEN ? AND ?",
-                    (start_iso, end_iso)
-                )
-                fallback_sent = int((cur.fetchone() or [0])[0] or 0)
-                total_emails_sent = fallback_sent
-            else:
-                total_emails_sent = delivered_distinct
+            # Count distinct bounced/dropped events
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT (email || '||' || date(created_at)))
+                FROM email_events
+                WHERE event_type IN ('bounced', 'dropped') 
+                  AND created_at BETWEEN ? AND ?
+                """,
+                (start_iso, end_iso)
+            )
+            total_bounced = int((cur.fetchone() or [0])[0] or 0)
 
-            # open % using distinct message counts
-            pct_opened = round((open_distinct * 100.0 / delivered_distinct), 2) if delivered_distinct > 0 else None
+            # Count distinct open events
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT (email || '||' || date(created_at)))
+                FROM email_events
+                WHERE event_type = 'open' 
+                  AND created_at BETWEEN ? AND ?
+                """,
+                (start_iso, end_iso)
+            )
+            total_opened = int((cur.fetchone() or [0])[0] or 0)
 
-            # Average time between delivery and first opening (minutes), ignore opens > 12 hours
+            # Open percentage (opened / delivered)
+            pct_opened = round((total_opened * 100.0 / total_delivered), 2) if total_delivered > 0 else None
+
+            # Average time to first open (in minutes)
             cur.execute(
                 """
                 SELECT AVG((julianday(first_open) - julianday(delivered_at)) * 24.0 * 60.0) AS avg_minutes
                 FROM (
-                  SELECT d.created_at AS delivered_at,
-                    (SELECT MIN(o.created_at)
-                     FROM email_events o
-                     WHERE o.event_type = 'open'
-                       AND o.email = d.email
-                       AND COALESCE(o.item_url_hash,'') = COALESCE(d.item_url_hash,'')
-                       AND o.created_at >= d.created_at
-                       AND (julianday(o.created_at) - julianday(d.created_at)) <= 0.5
-                    ) AS first_open
-                  FROM email_events d
-                  WHERE d.event_type = 'delivered'
-                    AND d.created_at BETWEEN ? AND ?
+                    SELECT 
+                        d.created_at AS delivered_at,
+                        (SELECT MIN(o.created_at)
+                         FROM email_events o
+                         WHERE o.event_type = 'open'
+                           AND o.email = d.email
+                           AND o.created_at >= d.created_at
+                           AND (julianday(o.created_at) - julianday(d.created_at)) <= 0.5
+                        ) AS first_open
+                    FROM email_events d
+                    WHERE d.event_type = 'delivered'
+                      AND d.created_at BETWEEN ? AND ?
                 ) sub
                 WHERE first_open IS NOT NULL
                 """,
@@ -438,17 +435,15 @@ async def ticker_age(
                 "total_tickers_selected": total_tickers_selected,
                 "total_unique_tickers_selected": total_unique_tickers_selected,
                 "total_emails_sent": total_emails_sent,
-                "avg_emails_sent_per_user": round((total_emails_sent / total_users), 2) if total_users > 0 else 0.0,
-                "total_bounced_events": bounced_events,
-                "total_delivered_events": delivered_events,
-                "total_open_events": open_events,
-                "total_delivered_distinct": delivered_distinct,
-                "total_open_distinct": open_distinct,
+                "avg_emails_sent_per_user": avg_emails_per_user,
+                "total_bounced": total_bounced,
+                "total_delivered": total_delivered,
+                "total_opened": total_opened,
                 "pct_opened": pct_opened,
                 "avg_open_minutes": round(avg_open_minutes, 2) if avg_open_minutes is not None else None,
             }
-        except Exception:
-            log.exception("ticker_age: failed to compute summary metrics")
+        except Exception as e:
+            log.exception("ticker_age: failed to compute summary metrics - %s", e)
             summary = {}
 
         # Enrich rows with per-ticker user counts using user_tickers.email
@@ -486,4 +481,95 @@ async def ticker_age(
         return {"ok": True, "start": start_iso, "end": end_iso, "rows": rows, "summary": summary}
     except Exception as e:
         log.exception("ticker_age: failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sendgrid/metrics", summary="SendGrid metrics overview")
+async def sendgrid_metrics(
+    start: str = Query(..., description="Start date (YYYY-MM-DD)"),
+    end: str = Query(..., description="End date (YYYY-MM-DD)"),
+):
+    """
+    Get metrics overview for SendGrid API calls, email sends, and webhook events.
+    """
+    try:
+        # Parse and normalize dates to IST day boundaries
+        start_dt = normalize_to_ist_day_start(datetime.fromisoformat(start))  # 00:00:00
+        end_dt = normalize_to_ist_day_end(datetime.fromisoformat(end))        # 23:59:59
+        
+        # Enforce 365-day maximum
+        start_dt, end_dt = enforce_date_range(start_dt, end_dt, max_days=365)
+        
+        # Convert to ISO strings
+        start_iso = start_dt.isoformat()
+        end_iso = end_dt.isoformat()
+        
+        log.info(f"Fetching SendGrid metrics from {start_iso} to {end_iso}")
+        
+        conn = sqlite3.connect(CACHE_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # 1) vendor API calls for SendGrid
+        cur.execute(
+            """
+            SELECT provider, event, COUNT(*) AS cnt
+            FROM vendor_metrics
+            WHERE provider = 'sendgrid' AND created_at BETWEEN ? AND ?
+            GROUP BY provider, event
+            """,
+            (start_iso, end_iso)
+        )
+        vendor_calls = [dict(row) for row in cur.fetchall()]
+
+        # 2) successful email sends recorded (email_logs.ok = 1)
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM email_logs
+            WHERE ok = 1 AND sent_at BETWEEN ? AND ?
+            """,
+            (start_iso, end_iso)
+        )
+        total_successful_sends = cur.fetchone()[0] or 0
+
+        # 3) webhook events by type
+        cur.execute(
+            """
+            SELECT event_type, COUNT(*) FROM email_events
+            WHERE created_at BETWEEN ? AND ?
+            GROUP BY event_type
+            """,
+            (start_iso, end_iso)
+        )
+        webhook_events = [dict(row) for row in cur.fetchall()]
+
+        # 4) how many email_logs have no matching email_events (best-effort match by email + sent_at)
+        cur.execute(
+            """
+            SELECT el.id, el.to_email, el.sent_at
+            FROM email_logs el
+            LEFT JOIN email_events ev
+              ON ev.email = el.to_email AND ev.email_sent_at IS NOT NULL AND date(ev.email_sent_at) = date(el.sent_at)
+            WHERE el.ok = 1
+              AND el.sent_at BETWEEN ? AND ?
+              AND ev.id IS NULL
+            LIMIT 50
+            """,
+            (start_iso, end_iso)
+        )
+        unmatched_email_logs = [dict(row) for row in cur.fetchall()]
+
+        conn.close()
+
+        return {
+            "ok": True,
+            "start": start_iso,
+            "end": end_iso,
+            "vendor_calls": vendor_calls,
+            "total_successful_sends": total_successful_sends,
+            "webhook_events": webhook_events,
+            "unmatched_email_logs": unmatched_email_logs,
+        }
+    except Exception as e:
+        log.exception("sendgrid_metrics: failed")
         raise HTTPException(status_code=500, detail=str(e))
