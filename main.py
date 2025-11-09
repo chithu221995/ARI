@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import aiosqlite
+import os
 
 # Configure logging early to ensure all logs are captured
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
@@ -22,8 +23,20 @@ from app.routes import dashboard_metrics
 from app.api.admin.cache import router as cache_router
 from app.api.admin.errors import router as errors_router
 
+# DB connection helpers: prefer DATABASE_URL (e.g. postgres) otherwise use local sqlite path
+DATABASE_URL = os.getenv("DATABASE_URL")
+SQLITE_PATH = os.getenv("SQLITE_PATH", "./ari.db")
+
+# If DATABASE_URL is provided, create an async SQLAlchemy engine for that DB.
+# Otherwise continue using aiosqlite throughout the codebase (local dev).
+engine = None
+if DATABASE_URL:
+    from sqlalchemy.ext.asyncio import create_async_engine
+    engine = create_async_engine(DATABASE_URL, future=True)
+else:
+    engine = None
+
 # database initialization helpers (kept)
-import os
 log = logging.getLogger("ari.cache")
 
 async def _db_path() -> str:
