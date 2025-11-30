@@ -23,6 +23,9 @@ from app.routes import dashboard_metrics
 from app.api.admin.cache import router as cache_router
 from app.api.admin.errors import router as errors_router
 
+# database initialization helpers (kept)
+log = logging.getLogger("ari.cache")
+
 # DB connection helpers: prefer DATABASE_URL (e.g. postgres) otherwise use local sqlite path
 DATABASE_URL = os.getenv("DATABASE_URL")
 SQLITE_PATH = os.getenv("SQLITE_PATH", "./ari.db")
@@ -32,12 +35,24 @@ SQLITE_PATH = os.getenv("SQLITE_PATH", "./ari.db")
 engine = None
 if DATABASE_URL:
     from sqlalchemy.ext.asyncio import create_async_engine
-    engine = create_async_engine(DATABASE_URL, future=True)
+    
+    # Normalize postgresql:// or postgres:// to postgresql+asyncpg://
+    url = DATABASE_URL
+    if url.startswith("postgresql://") or url.startswith("postgres://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif not url.startswith("postgresql+asyncpg://"):
+        # If it's not already asyncpg and not a standard postgres URL, assume it needs asyncpg
+        if "postgresql" in url.lower():
+            url = url.replace("postgresql", "postgresql+asyncpg", 1)
+    
+    engine = create_async_engine(url, future=True, echo=False)
+    
+    # Log which driver is being used
+    log.info(f"SQLAlchemy engine created with URL: {url.split('@')[0]}@*** (driver: asyncpg)")
 else:
     engine = None
-
-# database initialization helpers (kept)
-log = logging.getLogger("ari.cache")
+    log.info("Using local SQLite (aiosqlite) - no DATABASE_URL provided")
 
 async def _db_path() -> str:
     return os.getenv("SQLITE_PATH", "./ari.db")
