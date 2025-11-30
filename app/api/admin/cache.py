@@ -60,3 +60,52 @@ async def cache_diagnostics(request: Request):
             "error_message": error_message
         }
     )
+
+
+@router.post("/catalog/reload")
+async def reload_catalog():
+    """
+    Reload ticker catalog from CSV file.
+    Drops and recreates the ticker_catalog table with data from ./catalog/tickers.csv
+    """
+    import csv
+    import os
+    import aiosqlite
+
+    catalog_path = "./catalog/tickers.csv"
+
+    if not os.path.exists(catalog_path):
+        return {"status": "error", "message": "tickers.csv not found"}
+
+    try:
+        async with aiosqlite.connect(CACHE_DB_PATH) as db:
+
+            await db.execute("DROP TABLE IF EXISTS ticker_catalog")
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS ticker_catalog (
+                    ticker TEXT PRIMARY KEY,
+                    name TEXT,
+                    aliases TEXT
+                )
+            """)
+
+            rows = 0
+            with open(catalog_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ticker = row["ticker"].strip().upper()
+                    name = row["name"].strip()
+                    aliases = row.get("aliases", "")
+                    await db.execute(
+                        "INSERT INTO ticker_catalog (ticker, name, aliases) VALUES (?, ?, ?)",
+                        (ticker, name, aliases)
+                    )
+                    rows += 1
+
+            await db.commit()
+
+        return {"status": "ok", "rows": rows}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
