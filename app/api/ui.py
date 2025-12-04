@@ -210,7 +210,7 @@ async def dashboard_post(
             # Upsert user
             from datetime import datetime, timezone
 
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime.now(timezone.utc).isoformat()
             await conn.execute(
                 text("INSERT INTO users(email, created_at) VALUES (:email, :created_at) ON CONFLICT(email) DO NOTHING"),
                 {"email": email, "created_at": now_dt}

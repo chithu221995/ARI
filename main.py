@@ -101,15 +101,18 @@ from app.db.migrations.link_summaries_to_articles import migrate_link_summaries_
 async def lifespan(app: FastAPI):
     log.info("Application startup")
 
-    # Migrations
-    try:
-        db_path = SQLITE_PATH
-        await migrate_add_run_errors(db_path)
-        await migrate_add_news_age_column(db_path)
-        await migrate_link_summaries_to_articles(db_path)
-        log.info("Migrations completed successfully")
-    except Exception as e:
-        log.error(f"Migration failed: {e}")
+    # Only run SQLite migrations when we are actually using SQLite
+    if not DATABASE_URL:
+        try:
+            db_path = SQLITE_PATH
+            await migrate_add_run_errors(db_path)
+            await migrate_add_news_age_column(db_path)
+            await migrate_link_summaries_to_articles(db_path)
+            log.info("Migrations completed successfully")
+        except Exception as e:
+            log.error(f"Migration failed: {e}")
+    else:
+        log.info("DATABASE_URL is set; skipping SQLite migrations (Neon/Postgres mode).")
 
     yield
     log.info("Application shutdown")
