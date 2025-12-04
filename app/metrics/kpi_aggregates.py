@@ -6,10 +6,10 @@ Called by /admin/metrics/kpi route.
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
-import aiosqlite
 import time
 
-from app.core.cache import CACHE_DB_PATH
+from sqlalchemy import text
+from app.db.pg import engine
 
 log = logging.getLogger("ari.metrics.kpi_aggregates")
 
@@ -19,9 +19,6 @@ async def compute_kpi_aggregates(
     end: str, 
     db_path: str | None = None
 ) -> Dict[str, Any]:
-    if not db_path:
-        db_path = CACHE_DB_PATH
-    
     log.info("compute_kpi_aggregates: computing KPIs for %s to %s", start, end)
     log.info(f"kpi_aggregates: START for {start} to {end}")
     t_start = time.time()
@@ -43,23 +40,22 @@ async def compute_kpi_aggregates(
     }
 
     try:
-        async with aiosqlite.connect(db_path) as db:
-            db.row_factory = aiosqlite.Row
-            
+        async with engine.connect() as conn:
+
             # --- Delivery KPIs ---
             log.debug("Computing delivery KPIs")
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT 
                     CAST(SUM(ok) AS REAL) / COUNT(*) AS send_success_rate,
                     AVG(latency_ms) AS avg_latency_ms,
                     MAX(latency_ms) AS max_latency_ms
                 FROM metrics 
-                WHERE event='email' AND timestamp BETWEEN ? AND ?
-                """,
-                (start, end)
+                WHERE event='email' AND timestamp BETWEEN :start AND :end
+                """),
+                {"start": start, "end": end}
             )
-            delivery_row = await cursor.fetchone()
+            delivery_row = result.fetchone()
             
             if delivery_row:
                 results["delivery"] = {
@@ -78,17 +74,17 @@ async def compute_kpi_aggregates(
             log.debug("Computing relevance KPIs (rating-based)")
             
             # Fetch all feedback events with ratings (1-5 stars)
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT rating
                 FROM email_events
                 WHERE event_type='feedback' 
-                  AND created_at BETWEEN ? AND ?
+                  AND created_at BETWEEN :start AND :end
                   AND rating IS NOT NULL
-                """,
-                (start, end)
+                """),
+                {"start": start, "end": end}
             )
-            feedback_rows = await cursor.fetchall()
+            feedback_rows = result.fetchall()
             
             # Extract ratings from rows
             ratings = [row[0] for row in feedback_rows if row[0] is not None]
@@ -119,8 +115,8 @@ async def compute_kpi_aggregates(
             # --- Freshness KPIs (existing) ---
             log.debug("Computing freshness KPIs (using news_age at fetch time)")
             
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT 
                     COUNT(*) as total_articles,
                     AVG(news_age) as avg_age_hours,
@@ -128,13 +124,12 @@ async def compute_kpi_aggregates(
                 FROM articles
                 WHERE content IS NOT NULL
                   AND LENGTH(content) > 0
-                  AND created_at BETWEEN ? AND ?
+                  AND created_at BETWEEN :start AND :end
                   AND news_age IS NOT NULL
-                """,
-                (start, end)
+                """),
+                {"start": start, "end": end}
             )
-            
-            row = await cursor.fetchone()
+            row = result.fetchone()
             
             if row and (row["total_articles"] or 0) > 0:
                 total_articles = int(row["total_articles"] or 0)
@@ -166,8 +161,8 @@ async def compute_kpi_aggregates(
             # --- NEW: Sent Articles Freshness ---
             log.debug("Computing sent articles freshness (articles actually delivered to users)")
             
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT 
                     COUNT(DISTINCT s.item_url_hash) as total_sent,
                     AVG(a.news_age) as avg_age_hours_sent,
@@ -175,13 +170,12 @@ async def compute_kpi_aggregates(
                     AVG(s.relevance) as avg_relevance_sent
                 FROM summaries s
                 INNER JOIN articles a ON s.url = a.url
-                WHERE s.created_at BETWEEN ? AND ?
+                WHERE s.created_at BETWEEN :start AND :end
                   AND a.news_age IS NOT NULL
-                """,
-                (start, end)
+                """),
+                {"start": start, "end": end}
             )
-            
-            sent_row = await cursor.fetchone()
+            sent_row = result.fetchone()
             
             if sent_row and (sent_row["total_sent"] or 0) > 0:
                 total_sent = int(sent_row["total_sent"] or 0)
@@ -217,16 +211,15 @@ async def compute_kpi_aggregates(
             # --- NEW: Total Summaries Created ---
             log.debug("Computing total summaries created")
             
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT COUNT(*) as total_summaries
                 FROM summaries
-                WHERE created_at BETWEEN ? AND ?
-                """,
-                (start, end)
+                WHERE created_at BETWEEN :start AND :end
+                """),
+                {"start": start, "end": end}
             )
-            
-            summary_row = await cursor.fetchone()
+            summary_row = result.fetchone()
             total_summaries = int(summary_row["total_summaries"] or 0) if summary_row else 0
             
             results["summaries"] = {
@@ -239,31 +232,31 @@ async def compute_kpi_aggregates(
             log.debug("Computing coverage KPIs")
             
             # Get unique tickers that have articles (no date filter since published_at is NULL)
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT DISTINCT ticker
                 FROM articles
                 WHERE ticker IS NOT NULL
                   AND ticker != ''
-                """
+                """)
             )
-            unique_tickers_with_articles = [row[0] for row in await cursor.fetchall()]
+            unique_tickers_with_articles = [row[0] for row in result.fetchall()]
             total_unique_tickers = len(unique_tickers_with_articles)
             
             log.debug(f"Found {total_unique_tickers} unique tickers with articles: {unique_tickers_with_articles}")
             
             # Get tickers that have summaries in the date range
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT DISTINCT ticker
                 FROM summaries
-                WHERE created_at BETWEEN ? AND ?
+                WHERE created_at BETWEEN :start AND :end
                   AND ticker IS NOT NULL
                   AND ticker != ''
-                """,
-                (start, end)
+                """),
+                {"start": start, "end": end}
             )
-            covered_tickers = [row[0] for row in await cursor.fetchall()]
+            covered_tickers = [row[0] for row in result.fetchall()]
             covered_count = len(covered_tickers)
             
             log.debug(f"Found {covered_count} tickers with summaries in range: {covered_tickers}")
@@ -297,9 +290,11 @@ async def compute_kpi_aggregates(
             
             log.debug(f"Normalized quality sources: {sorted(normalized_quality)}")
             
-            # Query with domain normalization in SQL
-            cursor = await db.execute(
-                """
+            # Query with domain normalization in SQL - build named placeholders
+            nq = [d.replace('www.', '').lower() for d in normalized_quality]
+            if nq:
+                placeholders = ",".join(f":q{i}" for i in range(len(nq)))
+                sql = f"""
                 SELECT 
                     COUNT(*) AS total_items,
                     SUM(
@@ -310,11 +305,23 @@ async def compute_kpi_aggregates(
                         END
                     ) AS quality_items
                 FROM email_items
-                WHERE sent_at BETWEEN ? AND ?
-                """.replace('{placeholders}', ','.join('?' * len(normalized_quality))),
-                (*[d.replace('www.', '').lower() for d in normalized_quality], start, end)
-            )
-            quality_row = await cursor.fetchone()
+                WHERE sent_at BETWEEN :start AND :end
+                """
+                params = {f"q{i}": v for i, v in enumerate(nq)}
+                params.update({"start": start, "end": end})
+                result = await conn.execute(text(sql), params)
+            else:
+                result = await conn.execute(
+                    text("""
+                    SELECT 
+                        COUNT(*) AS total_items,
+                        0 AS quality_items
+                    FROM email_items
+                    WHERE sent_at BETWEEN :start AND :end
+                    """),
+                    {"start": start, "end": end}
+                )
+            quality_row = result.fetchone()
             
             total_items = quality_row[0] or 0
             quality_items = quality_row[1] or 0
@@ -332,27 +339,27 @@ async def compute_kpi_aggregates(
             log.debug("Computing coverage KPIs")
             
             # Get unique tickers that had articles in the date range
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT DISTINCT ticker
                 FROM email_items
-                WHERE sent_at BETWEEN ? AND ?
-                """,
-                (start, end)
+                WHERE sent_at BETWEEN :start AND :end
+                """),
+                {"start": start, "end": end}
             )
-            unique_tickers_with_articles = [row[0] for row in await cursor.fetchall()]
+            unique_tickers_with_articles = [row[0] for row in result.fetchall()]
             total_unique_tickers = len(unique_tickers_with_articles)
             
             # Get tickers that have summaries in the date range
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT DISTINCT ticker
                 FROM summaries
-                WHERE created_at BETWEEN ? AND ?
-                """,
-                (start, end)
+                WHERE created_at BETWEEN :start AND :end
+                """),
+                {"start": start, "end": end}
             )
-            covered_tickers = [row[0] for row in await cursor.fetchall()]
+            covered_tickers = [row[0] for row in result.fetchall()]
             covered_count = len(covered_tickers)
             
             # Calculate percentage (covered / unique tickers with articles)
@@ -370,15 +377,15 @@ async def compute_kpi_aggregates(
             log.debug("Computing vendor performance KPIs")
             
             # Add debug query to check total vendor_metrics count
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM vendor_metrics WHERE created_at BETWEEN ? AND ?",
-                (start, end)
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM vendor_metrics WHERE created_at BETWEEN :start AND :end"),
+                {"start": start, "end": end}
             )
-            total_vendor_rows = (await cursor.fetchone())[0]
+            total_vendor_rows = (result.fetchone())[0]
             log.debug(f"Total vendor_metrics rows in range: {total_vendor_rows}")
             
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT 
                     provider,
                     event,
@@ -387,13 +394,13 @@ async def compute_kpi_aggregates(
                     CAST(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / COUNT(*) as success_pct,
                     AVG(latency_ms) as avg_latency_ms
                 FROM vendor_metrics
-                WHERE created_at BETWEEN ? AND ?
+                WHERE created_at BETWEEN :start AND :end
                 GROUP BY provider, event
                 ORDER BY provider, event
-                """,
-                (start, end)
+                """),
+                {"start": start, "end": end}
             )
-            vendor_rows = await cursor.fetchall()
+            vendor_rows = result.fetchall()
             
             log.info(f"compute_kpi_aggregates: found {len(vendor_rows)} vendor metrics (from {total_vendor_rows} total rows)")
             
@@ -418,7 +425,7 @@ async def compute_kpi_aggregates(
             end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
             mttd_start_dt = end_dt - timedelta(days=14)
             mttd_start = mttd_start_dt.replace(tzinfo=None).isoformat() + "Z"
-            mttd_result = await _compute_mttd(db, mttd_start, end)
+            mttd_result = await _compute_mttd(conn, mttd_start, end)
             
             results["mttd"] = mttd_result
             
@@ -429,7 +436,7 @@ async def compute_kpi_aggregates(
             
             # Use same 14-day window for MTTR — ensure ISO Z suffix
             mttr_start = mttd_start
-            mttr_result = await _compute_mttr(db, mttr_start, end)
+            mttr_result = await _compute_mttr(conn, mttr_start, end)
             
             # Map mttr_result to the requested JSON shape (avg/minor/major)
             results["mttr"] = {
@@ -462,7 +469,7 @@ async def compute_kpi_aggregates(
         raise
 
 
-async def _compute_avg_age_hours(db: aiosqlite.Connection, start: str, end: str) -> float | None:
+async def _compute_avg_age_hours(conn, start: str, end: str) -> float | None:
     """
     Compute average age of articles in hours (sent_at - published_at).
     Fallback: if DB returns 0 or None, sample recent rows and compute in Python (handles date formats).
@@ -481,17 +488,19 @@ async def _compute_avg_age_hours(db: aiosqlite.Connection, start: str, end: str)
         return None
 
     try:
-        cursor = await db.execute(
-            """
-            SELECT AVG((julianday(sent_at) - julianday(published_at)) * 24.0) AS avg_hours,
+        result = await conn.execute(
+            text("""
+            SELECT AVG(
+                EXTRACT(EPOCH FROM (sent_at::timestamptz - published_at::timestamptz)) / 3600.0
+            ) AS avg_hours,
                    COUNT(*) as cnt
             FROM email_items
-            WHERE sent_at BETWEEN ? AND ? 
+            WHERE sent_at BETWEEN :start AND :end 
               AND published_at IS NOT NULL
-            """,
-            (start, end)
+            """),
+            {"start": start, "end": end}
         )
-        row = await cursor.fetchone()
+        row = result.fetchone()
         db_avg = row[0] if row else None
         db_cnt = row[1] if row else 0
 
@@ -500,18 +509,18 @@ async def _compute_avg_age_hours(db: aiosqlite.Connection, start: str, end: str)
             return round(float(db_avg), 2)
 
         # Fallback: sample up to 200 rows and compute in Python to avoid DB date-format edge cases
-        cursor = await db.execute(
-            """
+        result = await conn.execute(
+            text("""
             SELECT sent_at, published_at
             FROM email_items
-            WHERE sent_at BETWEEN ? AND ?
+            WHERE sent_at BETWEEN :start AND :end
               AND published_at IS NOT NULL
             ORDER BY sent_at DESC
             LIMIT 200
-            """,
-            (start, end)
+            """),
+            {"start": start, "end": end}
         )
-        rows = await cursor.fetchall()
+        rows = result.fetchall()
         if not rows:
             return None
 
@@ -541,7 +550,7 @@ async def _compute_avg_age_hours(db: aiosqlite.Connection, start: str, end: str)
         return None
 
 
-async def _compute_mttd(db: aiosqlite.Connection, start: str, end: str) -> dict:
+async def _compute_mttd(conn, start: str, end: str) -> dict:
     """
     Compute Mean Time To Detect (MTTD) - average time from vendor failure to next success.
     
@@ -549,7 +558,7 @@ async def _compute_mttd(db: aiosqlite.Connection, start: str, end: str) -> dict:
     overnight/weekend downtime where system wasn't actively running.
     
     Args:
-        db: Active database connection
+        conn: Active SQLAlchemy connection
         start: Start datetime string (14 days ago recommended)
         end: End datetime string
         
@@ -560,17 +569,17 @@ async def _compute_mttd(db: aiosqlite.Connection, start: str, end: str) -> dict:
     
     try:
         # Get all failures in the time range
-        cursor = await db.execute(
-            """
+        result = await conn.execute(
+            text("""
             SELECT id, provider, event, created_at
             FROM vendor_metrics
-            WHERE created_at BETWEEN ? AND ?
+            WHERE created_at BETWEEN :start AND :end
               AND ok = 0
             ORDER BY provider, event, created_at
-            """,
-            (start, end)
+            """),
+            {"start": start, "end": end}
         )
-        failures = await cursor.fetchall()
+        failures = result.fetchall()
         
         if not failures:
             log.info("_compute_mttd: no failures found in range")
@@ -589,20 +598,20 @@ async def _compute_mttd(db: aiosqlite.Connection, start: str, end: str) -> dict:
             failure_id, provider, event, failure_time = failure
             
             # Find next success for same provider/event after this failure
-            cursor = await db.execute(
-                """
+            result = await conn.execute(
+                text("""
                 SELECT created_at
                 FROM vendor_metrics
-                WHERE provider = ?
-                  AND event = ?
-                  AND created_at > ?
+                WHERE provider = :provider
+                  AND event = :event
+                  AND created_at > :failure_time
                   AND ok = 1
                 ORDER BY created_at ASC
                 LIMIT 1
-                """,
-                (provider, event, failure_time)
+                """),
+                {"provider": provider, "event": event, "failure_time": failure_time}
             )
-            success_row = await cursor.fetchone()
+            success_row = result.fetchone()
             
             if success_row:
                 success_time = success_row[0]
@@ -662,7 +671,7 @@ async def _compute_mttd(db: aiosqlite.Connection, start: str, end: str) -> dict:
         }
 
 
-async def _compute_mttr(db: aiosqlite.Connection, start: str, end: str) -> dict:
+async def _compute_mttr(conn, start: str, end: str) -> dict:
     """
     Compute MTTR: average resolved duration (minutes) plus counts of minor/major/unresolved.
     Considers incidents where created_at OR resolved_at falls inside [start, end].
@@ -682,25 +691,16 @@ async def _compute_mttr(db: aiosqlite.Connection, start: str, end: str) -> dict:
         return None
 
     try:
-        # ensure table exists
-        cur = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='run_errors'")
-        exists = await cur.fetchone() is not None
-        await cur.close()
-        if not exists:
-            logging.getLogger("ari.metrics").warning("_compute_mttr: run_errors table not present")
-            return {"avg_minutes": None, "minor": 0, "major": 0, "unresolved": 0, "total_incidents": 0}
-
         # select rows where created_at or resolved_at is in window
         q = """
             SELECT id, created_at, resolved_at, provider, event, job_type
             FROM run_errors
-            WHERE (created_at BETWEEN ? AND ?)
-               OR (resolved_at BETWEEN ? AND ?)
+            WHERE (created_at BETWEEN :start AND :end)
+               OR (resolved_at BETWEEN :start AND :end)
             ORDER BY created_at DESC
         """
-        cur = await db.execute(q, (start, end, start, end))
-        rows = await cur.fetchall()
-        await cur.close()
+        result = await conn.execute(text(q), {"start": start, "end": end})
+        rows = result.fetchall()
 
         if not rows:
             return {"avg_minutes": None, "minor": 0, "major": 0, "unresolved": 0, "total_incidents": 0}
@@ -753,46 +753,45 @@ async def _compute_mttr(db: aiosqlite.Connection, start: str, end: str) -> dict:
         return {"avg_minutes": None, "minor": 0, "major": 0, "unresolved": 0, "total_incidents": 0}
 
 
-def compute_vendor_metrics(start: str, end: str) -> list[dict]:
+async def compute_vendor_metrics(start: str, end: str) -> list[dict]:
     """
     Compute vendor performance metrics.
     """
     log.info(f"compute_vendor_metrics: querying from {start} to {end}")
     
-    from app.core.cache import CACHE_DB_PATH
-    import sqlite3
-    
     try:
-        with sqlite3.connect(CACHE_DB_PATH, timeout=5) as conn:
-            cur = conn.cursor()
-            
+        async with engine.connect() as conn:
             # Check what event names are actually in the database
-            cur.execute("""
-                SELECT DISTINCT provider, event 
-                FROM vendor_metrics 
-                WHERE created_at >= ? AND created_at <= ?
-                ORDER BY provider, event
-            """, (start, end))
-            
-            distinct_events = cur.fetchall()
+            result = await conn.execute(
+                text("""
+                    SELECT DISTINCT provider, event 
+                    FROM vendor_metrics 
+                    WHERE created_at >= :start AND created_at <= :end
+                    ORDER BY provider, event
+                """),
+                {"start": start, "end": end}
+            )
+            distinct_events = result.fetchall()
             log.info(f"compute_vendor_metrics: found distinct provider/event pairs: {distinct_events}")
             
-            # Your existing query will work fine - it groups by whatever is in the DB
-            cur.execute("""
-                SELECT 
-                    provider,
-                    event,
-                    COUNT(*) as total,
-                    SUM(ok) as success,
-                    ROUND(SUM(ok) * 100.0 / COUNT(*), 2) as success_pct,
-                    ROUND(AVG(latency_ms), 1) as avg_latency_ms
-                FROM vendor_metrics
-                WHERE created_at >= ? AND created_at <= ?
-                GROUP BY provider, event
-                ORDER BY provider, event
-            """, (start, end))
+            result = await conn.execute(
+                text("""
+                    SELECT 
+                        provider,
+                        event,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) as success,
+                        ROUND(CAST(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS FLOAT) * 100.0 / NULLIF(COUNT(*),0), 2) as success_pct,
+                        ROUND(AVG(latency_ms)::numeric, 1) as avg_latency_ms
+                    FROM vendor_metrics
+                    WHERE created_at >= :start AND created_at <= :end
+                    GROUP BY provider, event
+                    ORDER BY provider, event
+                """),
+                {"start": start, "end": end}
+            )
             
-            rows = cur.fetchall()
+            rows = result.fetchall()
             log.info(f"compute_vendor_metrics: returning {len(rows)} vendor metrics")
             
             results = []
