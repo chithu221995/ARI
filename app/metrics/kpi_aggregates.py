@@ -129,7 +129,7 @@ async def compute_kpi_aggregates(
                 """),
                 {"start": start, "end": end}
             )
-            row = result.fetchone()
+            row = result.mappings().fetchone()
             
             if row and (row["total_articles"] or 0) > 0:
                 total_articles = int(row["total_articles"] or 0)
@@ -175,7 +175,7 @@ async def compute_kpi_aggregates(
                 """),
                 {"start": start, "end": end}
             )
-            sent_row = result.fetchone()
+            sent_row = result.mappings().fetchone()
             
             if sent_row and (sent_row["total_sent"] or 0) > 0:
                 total_sent = int(sent_row["total_sent"] or 0)
@@ -219,7 +219,7 @@ async def compute_kpi_aggregates(
                 """),
                 {"start": start, "end": end}
             )
-            summary_row = result.fetchone()
+            summary_row = result.mappings().fetchone()
             total_summaries = int(summary_row["total_summaries"] or 0) if summary_row else 0
             
             results["summaries"] = {
@@ -520,7 +520,7 @@ async def _compute_avg_age_hours(conn, start: str, end: str) -> float | None:
             """),
             {"start": start, "end": end}
         )
-        rows = result.fetchall()
+        rows = result.mappings().fetchall()
         if not rows:
             return None
 
@@ -700,7 +700,7 @@ async def _compute_mttr(conn, start: str, end: str) -> dict:
             ORDER BY created_at DESC
         """
         result = await conn.execute(text(q), {"start": start, "end": end})
-        rows = result.fetchall()
+        rows = result.mappings().fetchall()
 
         if not rows:
             return {"avg_minutes": None, "minor": 0, "major": 0, "unresolved": 0, "total_incidents": 0}
