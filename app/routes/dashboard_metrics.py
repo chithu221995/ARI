@@ -9,6 +9,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import logging
 
+from app.db.pg import pg_fetch_all
+
 log = logging.getLogger("ari.dashboard.metrics")
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -65,3 +67,27 @@ async def show_metrics_dashboard(
             """,
             status_code=500
         )
+
+
+@router.get("/dashboard", response_class=HTMLResponse)
+async def show_dashboard(request: Request):
+    """
+    Display user dashboard for managing ticker selections.
+    """
+    # Load ticker catalog from Postgres
+    tickers = []
+    try:
+        rows = await pg_fetch_all("SELECT ticker, name FROM tickers ORDER BY ticker;")
+        tickers = [(r["ticker"], f"{r['ticker']} - {r['name']}") for r in rows]
+    except Exception as e:
+        log.warning(f"Could not load tickers from Postgres: {e}")
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "tickers": tickers,
+            "email": None,
+            "selected": {}
+        }
+    )

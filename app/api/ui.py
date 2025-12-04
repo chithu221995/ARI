@@ -1,5 +1,4 @@
 from __future__ import annotations
-import os
 import logging
 import re
 from datetime import datetime, timezone
@@ -8,7 +7,8 @@ from typing import Optional
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-import aiosqlite
+
+from app.db.pg import pg_fetch_all
 
 log = logging.getLogger("ari.ui")
 router = APIRouter()
@@ -24,40 +24,24 @@ def _valid_email(s: str) -> bool:
     return bool(EMAIL_RX.match(s or ""))
 
 
-def _utc_now_iso() -> str:
-    """Return current UTC timestamp as ISO string without microseconds."""
-    return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat()
-
-
-async def _get_active_tickers(db_path: str) -> list[tuple[str, str]]:
+async def _get_active_tickers():
     """
-    Load active tickers from ticker_catalog.
-    Returns list of (ticker, "TICKER — Company Name") tuples sorted by company_name.
+    Load all tickers from Postgres 'tickers' table.
+    Return list of dicts: { "ticker": "...", "name": "..."}
     """
-    try:
-        async with aiosqlite.connect(db_path) as db:
-            cur = await db.execute(
-                "SELECT ticker, company_name FROM ticker_catalog WHERE active=1 ORDER BY company_name"
-            )
-            rows = await cur.fetchall()
-            await cur.close()
-            return [(row[0], f"{row[0]} — {row[1]}") for row in rows]
-    except Exception:
-        log.exception("_get_active_tickers: failed")
-        return []
+    rows = await pg_fetch_all(
+        "SELECT ticker, name FROM tickers ORDER BY name;"
+    )
+    return [{"ticker": r["ticker"], "name": r["name"]} for r in rows]
 
 
-async def _load_user_tickers(db_path: str, email: str) -> list[dict]:
-    """Load current user_tickers for given email, ordered by rank."""
+async def _load_user_tickers(email: str) -> list[dict]:
+    """Load current user_tickers for given email from Postgres, ordered by rank."""
     try:
-        async with aiosqlite.connect(db_path) as db:
-            cur = await db.execute(
-                "SELECT ticker, company_name, rank FROM user_tickers WHERE email=? ORDER BY rank",
-                (email,)
-            )
-            rows = await cur.fetchall()
-            await cur.close()
-            return [{"ticker": r[0], "company_name": r[1], "rank": r[2]} for r in rows]
+        rows = await pg_fetch_all(
+            f"SELECT ticker, company_name, rank FROM user_tickers WHERE email='{email}' ORDER BY rank"
+        )
+        return [{"ticker": r["ticker"], "company_name": r["company_name"], "rank": r["rank"]} for r in rows]
     except Exception:
         log.exception("_load_user_tickers: failed for email=%s", email)
         return []
@@ -75,8 +59,8 @@ async def dashboard_get(request: Request, email: Optional[str] = None):
     Render dashboard form with 7 ticker slots.
     If email query param provided, pre-populate with existing selections.
     """
-    db_path = os.getenv("SQLITE_PATH", "./ari.db")
-    tickers = await _get_active_tickers(db_path)
+    ticker_list = await _get_active_tickers()
+    tickers = [(t["ticker"], f"{t['ticker']} - {t['name']}") for t in ticker_list]
     
     selected = {}
     email = ""
@@ -116,11 +100,11 @@ async def dashboard_post(
     Handle dashboard form submission.
     Validate and save user ticker selections.
     """
-    db_path = os.getenv("SQLITE_PATH", "./ari.db")
     
     # Validate email with helper
     if not _valid_email(email):
-        tickers = await _get_active_tickers(db_path)
+        ticker_list = await _get_active_tickers()
+        tickers = [(t["ticker"], f"{t['ticker']} - {t['name']}") for t in ticker_list]
         return templates.TemplateResponse(
             "dashboard.html",
             {
@@ -150,7 +134,8 @@ async def dashboard_post(
     log.info("dashboard: email=%s raw selections=%s", email, selected)
 
     if len(selected) < 3:
-        tickers = await _get_active_tickers(db_path)
+        ticker_list = await _get_active_tickers()
+        tickers = [(t["ticker"], f"{t['ticker']} - {t['name']}") for t in ticker_list]
         selected_dict = {rank: ticker for rank, ticker in slot_tickers if ticker.strip()}
         return templates.TemplateResponse(
             "dashboard.html",
@@ -166,7 +151,8 @@ async def dashboard_post(
     unique_tickers = set(ticker for _, ticker in selected)
     
     if len(selected) != len(unique_tickers):
-        tickers = await _get_active_tickers(db_path)
+        ticker_list = await _get_active_tickers()
+        tickers = [(t["ticker"], f"{t['ticker']} - {t['name']}") for t in ticker_list]
         selected_dict = {rank: ticker for rank, ticker in slot_tickers if ticker.strip()}
         return templates.TemplateResponse(
             "dashboard.html",
@@ -180,7 +166,8 @@ async def dashboard_post(
         )
     
     if len(selected) > 7:
-        tickers = await _get_active_tickers(db_path)
+        ticker_list = await _get_active_tickers()
+        tickers = [(t["ticker"], f"{t['ticker']} - {t['name']}") for t in ticker_list]
         selected_dict = {rank: ticker for rank, ticker in slot_tickers if ticker.strip()}
         return templates.TemplateResponse(
             "dashboard.html",
@@ -193,17 +180,22 @@ async def dashboard_post(
             }
         )
     
-    # Save to database
+    # Save to database (Postgres)
     try:
-        async with aiosqlite.connect(db_path) as db:
-            await db.execute("PRAGMA foreign_keys=ON;")
+        from app.db.pg import engine
+        from sqlalchemy import text
+        
+        # Check if user already exists
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                text("SELECT 1 FROM users WHERE email = :email"),
+                {"email": email}
+            )
+            exists = result.fetchone()
             
-            # Prevent editing for existing users (pilot restriction)
-            cur = await db.execute("SELECT 1 FROM users WHERE email=?", (email,))
-            exists = await cur.fetchone()
-            await cur.close()
             if exists:
-                tickers = await _get_active_tickers(db_path)
+                ticker_list = await _get_active_tickers()
+                tickers = [(t["ticker"], f"{t['ticker']} - {t['name']}") for t in ticker_list]
                 return templates.TemplateResponse(
                     "dashboard.html",
                     {
@@ -216,41 +208,52 @@ async def dashboard_post(
                 )
             
             # Upsert user
-            now_iso = _utc_now_iso()
-            await db.execute(
-                "INSERT INTO users(email, created_at) VALUES (?, ?) ON CONFLICT(email) DO NOTHING",
-                (email, now_iso)
+            from datetime import datetime, timezone
+
+            now_dt = datetime.now(timezone.utc)
+            await conn.execute(
+                text("INSERT INTO users(email, created_at) VALUES (:email, :created_at) ON CONFLICT(email) DO NOTHING"),
+                {"email": email, "created_at": now_dt}
+            )
+            # Clear existing user_tickers
+            await conn.execute(
+                text("DELETE FROM user_tickers WHERE email = :email"),
+                {"email": email}
             )
             
-            # Clear existing user_tickers
-            await db.execute("DELETE FROM user_tickers WHERE email=?", (email,))
-            
-            # Insert new selections with catalog lookup
+            # Insert new selections
             saved_tickers = []
             for rank, ticker in selected:
-                # Lookup from catalog to get authoritative company_name and aliases
-                cur = await db.execute(
-                    "SELECT company_name, aliases_json FROM ticker_catalog WHERE ticker=? AND active=1",
-                    (ticker,)
+                # Lookup from tickers table
+                result = await conn.execute(
+                    text("SELECT name, aliases FROM tickers WHERE ticker = :ticker"),
+                    {"ticker": ticker}
                 )
-                row = await cur.fetchone()
-                await cur.close()
+                row = result.fetchone()
                 
                 if not row:
-                    log.warning("dashboard: ticker=%s not found in catalog for email=%s", ticker, email)
+                    log.warning("dashboard: ticker=%s not found in tickers table for email=%s", ticker, email)
                     continue
                 
-                company_name, aliases_json = row
-                await db.execute(
-                    """
-                    INSERT INTO user_tickers(email, ticker, company_name, aliases_json, rank, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (email, ticker, company_name, aliases_json, rank, now_iso)
+                company_name = row[0]
+                aliases_json = row[1] if len(row) > 1 else ""
+                
+                await conn.execute(
+                    text("""
+                        INSERT INTO user_tickers(email, ticker, company_name, aliases_json, rank, created_at)
+                        VALUES (:email, :ticker, :company_name, :aliases_json, :rank, :created_at)
+                    """),
+                    {
+                        "email": email,
+                        "ticker": ticker,
+                        "company_name": company_name,
+                        "aliases_json": aliases_json,
+                        "rank": rank,
+                        "created_at": now_dt
+                    }
                 )
                 saved_tickers.append({"rank": rank, "ticker": ticker, "company_name": company_name})
             
-            await db.commit()
             log.info("dashboard: upserted %d tickers for email=%s", len(saved_tickers), email)
             
             # Render success page
@@ -265,7 +268,8 @@ async def dashboard_post(
             
     except Exception:
         log.exception("dashboard: save failed for email=%s", email)
-        tickers = await _get_active_tickers(db_path)
+        ticker_list = await _get_active_tickers()
+        tickers = [(t["ticker"], f"{t['ticker']} - {t['name']}") for t in ticker_list]
         selected_dict = {rank: ticker for rank, ticker in slot_tickers if ticker.strip()}
         return templates.TemplateResponse(
             "dashboard.html",
